@@ -1,0 +1,26 @@
+name: example_run
+symbol: EURUSD
+timeframe: M5
+data_path: data/example_bars.csv
+
+instrument:
+  pip_size: 0.0001
+
+strategy:
+  name: ExampleMomentum
+  params:
+    sma_n: 20
+    qty: 1.0
+    warmup_bars: 50
+    sl_pips: 10
+    tp_pips: 20
+
+execution:
+  fill_mode: next_open          # close | next_open
+  intrabar_path: OHL C          # "OHLC" | "OLHC" (spaces ignored)
+  intrabar_tie: sl_first        # fallback if needed
+
+costs:
+  commission: 0.0
+  spread_pips: 1.0
+  slippage_pips: 0.0
