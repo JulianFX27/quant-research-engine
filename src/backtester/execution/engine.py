@@ -19,6 +19,11 @@ class Trade:
     pnl: float
     tag: str
     exit_reason: str
+    # Persist SL/TP used for this trade (if available) so research metrics can compute R
+    sl_price: float | None = None
+    tp_price: float | None = None
+    # Formal R contract: risk measured in price units
+    risk_price: float | None = None
 
 
 class SimpleBarEngine:
@@ -81,7 +86,6 @@ class SimpleBarEngine:
         Assumption: if a level is between low/high, it is reachable.
         Path models which extreme is visited first.
         """
-        # Reachability
         hit_sl = l <= sl <= h
         hit_tp = l <= tp <= h
         if not hit_sl and not hit_tp:
@@ -91,23 +95,14 @@ class SimpleBarEngine:
         if hit_tp and not hit_sl:
             return "TP"
 
-        # Both reachable: use path + position direction
-        # For a long:
-        #  - TP is above, SL is below typically.
-        #  - If path goes to High first (OHLC), TP occurs before SL.
-        #  - If path goes to Low first (OLHC), SL occurs before TP.
-        #
-        # For a short, TP usually below and SL above; the reasoning mirrors:
-        #  - OHLC (high first) tends to hit SL first (if SL above), then later TP (low)
-        #  - OLHC (low first) tends to hit TP first, then later SL
         if self.intrabar_path == "OHLC":
             if pos_side == "BUY":
-                return "TP"  # high first
-            return "SL"      # high first hits short SL (above) before low hits TP (below)
+                return "TP"
+            return "SL"
         else:  # OLHC
             if pos_side == "BUY":
-                return "SL"  # low first
-            return "TP"      # low first hits short TP (below) before high hits SL (above)
+                return "SL"
+            return "TP"
 
     def run(self, df: pd.DataFrame, intents_by_bar: List[List[OrderIntent]]) -> List[Trade]:
         trades: List[Trade] = []
@@ -119,6 +114,10 @@ class SimpleBarEngine:
         sl: Optional[float] = None
         tp: Optional[float] = None
         tag: str = ""
+
+        pos_sl_price: Optional[float] = None
+        pos_tp_price: Optional[float] = None
+        pos_risk_price: Optional[float] = None
 
         pending_intent: Optional[OrderIntent] = None
         pending_tag: str = ""
@@ -132,8 +131,15 @@ class SimpleBarEngine:
                 pos_qty = float(pending_intent.qty)
                 entry_price = self._fill_entry(o, pos_side)
                 entry_time = ts
+
                 sl = float(pending_intent.sl_price) if pending_intent.sl_price is not None else None
                 tp = float(pending_intent.tp_price) if pending_intent.tp_price is not None else None
+                pos_sl_price = sl
+                pos_tp_price = tp
+
+                # Formal risk contract: abs(filled_entry_price - sl_level_price)
+                pos_risk_price = abs(float(entry_price) - float(sl)) if (sl is not None) else None
+
                 tag = pending_tag
                 pending_intent = None
                 pending_tag = ""
@@ -144,7 +150,6 @@ class SimpleBarEngine:
                 exit_level: Optional[float] = None
 
                 if sl is not None or tp is not None:
-                    # Determine exit reason
                     if sl is not None and tp is not None:
                         reason = self._decide_exit_reason(o, h, l, c, pos_side, float(sl), float(tp))
                         if reason == "SL":
@@ -158,7 +163,6 @@ class SimpleBarEngine:
                         if l <= float(tp) <= h:
                             exit_reason, exit_level = "TP", float(tp)
 
-                # Fallback tie-break (only if both hit and path logic couldn't decide, rare)
                 if exit_reason is None and sl is not None and tp is not None:
                     hit_sl = l <= float(sl) <= h
                     hit_tp = l <= float(tp) <= h
@@ -189,6 +193,9 @@ class SimpleBarEngine:
                             pnl=float(pnl),
                             tag=tag,
                             exit_reason=exit_reason,
+                            sl_price=pos_sl_price,
+                            tp_price=pos_tp_price,
+                            risk_price=pos_risk_price,
                         )
                     )
 
@@ -199,6 +206,9 @@ class SimpleBarEngine:
                     sl = None
                     tp = None
                     tag = ""
+                    pos_sl_price = None
+                    pos_tp_price = None
+                    pos_risk_price = None
 
             # Schedule / fill entries
             if pos_side is None and pending_intent is None:
@@ -215,8 +225,14 @@ class SimpleBarEngine:
                         pos_qty = float(intent.qty)
                         entry_price = self._fill_entry(c, pos_side)
                         entry_time = ts
+
                         sl = float(intent.sl_price) if intent.sl_price is not None else None
                         tp = float(intent.tp_price) if intent.tp_price is not None else None
+                        pos_sl_price = sl
+                        pos_tp_price = tp
+
+                        pos_risk_price = abs(float(entry_price) - float(sl)) if (sl is not None) else None
+
                         tag = intent.tag
 
         return trades

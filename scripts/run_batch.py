@@ -6,7 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import pandas as pd
 import yaml
@@ -19,11 +19,57 @@ class BatchItem:
     config_path: str
 
 
+LEADERBOARD_COLUMNS: List[str] = [
+    # Identity
+    "status",
+    "config_path",
+    "run_id",
+    "name",
+    "symbol",
+    "timeframe",
+    "strategy_name",
+    # Core metrics (PnL space)
+    "n_trades",
+    "total_pnl",
+    "winrate",
+    "avg_pnl",
+    "avg_win",
+    "avg_loss",
+    "profit_factor",
+    "profit_factor_is_inf",
+    # Risk / dynamics (PnL space)
+    "max_drawdown_abs",
+    "max_drawdown_pct",
+    "max_consecutive_losses",
+    "avg_hold_minutes",
+    "median_hold_minutes",
+    "min_hold_minutes",
+    "max_hold_minutes",
+    # R-space metrics (research-grade)
+    "n_trades_with_risk",
+    "expectancy_R",
+    "avg_R",
+    "median_R",
+    "winrate_R",
+    "avg_win_R",
+    "avg_loss_R",
+    "payoff_ratio_R",
+    "max_consecutive_losses_R",
+    "max_drawdown_R_abs",
+    "max_drawdown_R_pct",
+    # Outputs
+    "run_dir",
+    "metrics_path",
+    "trades_path",
+    "equity_path",
+]
+
+
 def _run_one(config_path: str, out_root: str) -> Dict[str, Any]:
     cfg = yaml.safe_load(Path(config_path).read_text())
     res = run_from_config(cfg, out_dir=out_root)
-    # Persist a small per-config summary (useful if process crashes mid-batch)
     return {
+        "status": "ok",
         "config_path": config_path,
         "run_id": res.get("run_id"),
         "outputs": res.get("outputs", {}),
@@ -33,6 +79,79 @@ def _run_one(config_path: str, out_root: str) -> Dict[str, Any]:
         "timeframe": cfg.get("timeframe"),
         "strategy_name": (cfg.get("strategy") or {}).get("name"),
     }
+
+
+def _is_header_like_row(row: Dict[str, Any]) -> bool:
+    """
+    Defensive guard: if a header-like record slips in (values equal column names),
+    drop it so the leaderboard CSV does not show a duplicated header line.
+    """
+    try:
+        return (
+            str(row.get("status", "")).strip() == "status"
+            and str(row.get("config_path", "")).strip() == "config_path"
+            and str(row.get("run_id", "")).strip() == "run_id"
+        )
+    except Exception:
+        return False
+
+
+def _normalize_status(s: Any) -> str:
+    s2 = str(s).strip().lower()
+    return s2 if s2 in {"ok", "error"} else "error"
+
+
+def _row_from_result(r: Dict[str, Any]) -> Dict[str, Any]:
+    m = r.get("metrics", {}) or {}
+    outs = r.get("outputs", {}) or {}
+
+    row: Dict[str, Any] = {
+        "status": _normalize_status(r.get("status", "ok")),
+        "config_path": r.get("config_path"),
+        "run_id": r.get("run_id"),
+        "name": r.get("name"),
+        "symbol": r.get("symbol"),
+        "timeframe": r.get("timeframe"),
+        "strategy_name": r.get("strategy_name"),
+        # Core
+        "n_trades": m.get("n_trades"),
+        "total_pnl": m.get("total_pnl"),
+        "winrate": m.get("winrate"),
+        "avg_pnl": m.get("avg_pnl"),
+        "avg_win": m.get("avg_win"),
+        "avg_loss": m.get("avg_loss"),
+        "profit_factor": m.get("profit_factor"),
+        "profit_factor_is_inf": m.get("profit_factor_is_inf"),
+        # Risk / dynamics (PnL)
+        "max_drawdown_abs": m.get("max_drawdown_abs"),
+        "max_drawdown_pct": m.get("max_drawdown_pct"),
+        "max_consecutive_losses": m.get("max_consecutive_losses"),
+        "avg_hold_minutes": m.get("avg_hold_minutes"),
+        "median_hold_minutes": m.get("median_hold_minutes"),
+        "min_hold_minutes": m.get("min_hold_minutes"),
+        "max_hold_minutes": m.get("max_hold_minutes"),
+        # R-space
+        "n_trades_with_risk": m.get("n_trades_with_risk"),
+        "expectancy_R": m.get("expectancy_R"),
+        "avg_R": m.get("avg_R"),
+        "median_R": m.get("median_R"),
+        "winrate_R": m.get("winrate_R"),
+        "avg_win_R": m.get("avg_win_R"),
+        "avg_loss_R": m.get("avg_loss_R"),
+        "payoff_ratio_R": m.get("payoff_ratio_R"),
+        "max_consecutive_losses_R": m.get("max_consecutive_losses_R"),
+        "max_drawdown_R_abs": m.get("max_drawdown_R_abs"),
+        "max_drawdown_R_pct": m.get("max_drawdown_R_pct"),
+        # Outputs
+        "run_dir": outs.get("run_dir"),
+        "metrics_path": outs.get("metrics"),
+        "trades_path": outs.get("trades"),
+        "equity_path": outs.get("equity"),
+    }
+
+    for col in LEADERBOARD_COLUMNS:
+        row.setdefault(col, None)
+    return row
 
 
 def main() -> None:
@@ -72,37 +191,36 @@ def main() -> None:
             except Exception as e:
                 errors.append({"config_path": cp, "error": repr(e)})
 
-    # Build leaderboard table
-    rows = []
-    for r in results:
-        m = r.get("metrics", {}) or {}
-        outs = r.get("outputs", {}) or {}
+    rows: List[Dict[str, Any]] = [_row_from_result(r) for r in results]
+
+    for er in errors:
         rows.append(
-            {
-                "config_path": r.get("config_path"),
-                "run_id": r.get("run_id"),
-                "name": r.get("name"),
-                "symbol": r.get("symbol"),
-                "timeframe": r.get("timeframe"),
-                "strategy_name": r.get("strategy_name"),
-                "n_trades": m.get("n_trades"),
-                "total_pnl": m.get("total_pnl"),
-                "winrate": m.get("winrate"),
-                "avg_pnl": m.get("avg_pnl"),
-                "profit_factor": m.get("profit_factor"),
-                "profit_factor_is_inf": m.get("profit_factor_is_inf"),
-                "run_dir": outs.get("run_dir"),
-                "metrics_path": outs.get("metrics"),
-                "trades_path": outs.get("trades"),
-                "equity_path": outs.get("equity"),
-            }
+            _row_from_result(
+                {
+                    "status": "error",
+                    "config_path": er.get("config_path"),
+                    "run_id": None,
+                    "outputs": {},
+                    "metrics": {},
+                    "name": None,
+                    "symbol": None,
+                    "timeframe": None,
+                    "strategy_name": None,
+                }
+            )
         )
 
-    df = pd.DataFrame(rows).sort_values(
-        by=["total_pnl", "winrate", "n_trades"],
-        ascending=[False, False, False],
+    # Drop any header-like row that could have slipped in
+    rows = [r for r in rows if not _is_header_like_row(r)]
+
+    df = pd.DataFrame(rows).reindex(columns=LEADERBOARD_COLUMNS)
+
+    df = df.sort_values(
+        by=["expectancy_R", "total_pnl", "winrate", "n_trades"],
+        ascending=[False, False, False, False],
         na_position="last",
     )
+
     df.to_csv(leaderboard_path, index=False)
 
     batch_manifest = {
