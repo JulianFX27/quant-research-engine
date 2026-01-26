@@ -19,6 +19,8 @@ class Trade:
     pnl: float
     tag: str
     exit_reason: str
+
+
     # Persist SL/TP used for this trade (if available) so research metrics can compute R
     sl_price: float | None = None
     tp_price: float | None = None
@@ -27,7 +29,7 @@ class Trade:
 
 
 class SimpleBarEngine:
-    """Minimal bar-by-bar engine (v1 hardened intrabar).
+    """Minimal bar-by-bar engine (v1 hardened intrabar) + guardrails.
 
     Features:
       - One position at a time
@@ -43,9 +45,17 @@ class SimpleBarEngine:
           - commission (abs per-unit per trade)
           - spread_price (full spread in price units)
           - slippage_price (adverse per fill)
+
+    Guardrails (risk_cfg):
+      - max_daily_loss_R: float | None
+          Stop taking new entries for the rest of the UTC day once realized_R <= -max_daily_loss_R.
+      - max_trades_per_day: int | None
+          Limit number of entries per UTC day.
+      - cooldown_bars: int
+          After a trade exits, block new entries until i >= cooldown_until_index.
     """
 
-    def __init__(self, *, costs: Dict[str, Any], exec_cfg: Dict[str, Any]):
+    def __init__(self, *, costs: Dict[str, Any], exec_cfg: Dict[str, Any], risk_cfg: Optional[Dict[str, Any]] = None):
         self.costs = costs
         self.exec_cfg = exec_cfg
         self.tie_break = exec_cfg.get("intrabar_tie", "sl_first")  # sl_first | tp_first
@@ -53,6 +63,21 @@ class SimpleBarEngine:
 
         raw_path = str(exec_cfg.get("intrabar_path", "OHLC")).replace(" ", "").upper()
         self.intrabar_path = raw_path if raw_path in ("OHLC", "OLHC") else "OHLC"
+
+        # Risk / guardrails config
+        risk_cfg = risk_cfg or {}
+        self.max_daily_loss_R: Optional[float] = (
+            float(risk_cfg["max_daily_loss_R"]) if risk_cfg.get("max_daily_loss_R") is not None else None
+        )
+        self.max_trades_per_day: Optional[int] = (
+            int(risk_cfg["max_trades_per_day"]) if risk_cfg.get("max_trades_per_day") is not None else None
+        )
+        self.cooldown_bars: int = int(risk_cfg.get("cooldown_bars", 0) or 0)
+        if self.cooldown_bars < 0:
+            self.cooldown_bars = 0
+
+        # Exposed after run() for persistence/audit (orchestrator can copy into metrics/manifest)
+        self.last_risk_report: Dict[str, Any] = {}
 
     def _apply_costs(self, pnl: float, qty: float) -> float:
         commission = float(self.costs.get("commission", 0.0))
@@ -79,7 +104,9 @@ class SimpleBarEngine:
             return level_price - half - slip
         return level_price + half + slip
 
-    def _decide_exit_reason(self, o: float, h: float, l: float, c: float, pos_side: str, sl: float, tp: float) -> Optional[str]:
+    def _decide_exit_reason(
+        self, o: float, h: float, l: float, c: float, pos_side: str, sl: float, tp: float
+    ) -> Optional[str]:
         """
         Decide whether SL or TP happens first within the bar using intrabar_path.
 
@@ -104,6 +131,32 @@ class SimpleBarEngine:
                 return "SL"
             return "TP"
 
+    @staticmethod
+    def _utc_day_key(ts: pd.Timestamp) -> str:
+        # ts is already UTC in your loader contract; normalize to midnight UTC
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            # contract says UTC; keep as-is
+            return t.normalize().isoformat()
+        return t.tz_convert("UTC").normalize().isoformat()
+
+    @staticmethod
+    def _safe_r_multiple(pnl: float, risk_price: Optional[float], qty: float) -> Optional[float]:
+        """
+        Compute realized R multiple using formal risk contract:
+          R = pnl / (risk_price * abs(qty))
+        where:
+          pnl is in (price * qty) units after costs,
+          risk_price is abs(entry_fill - sl_level) in price units,
+          qty is position size in "units".
+        """
+        if risk_price is None:
+            return None
+        denom = float(risk_price) * abs(float(qty))
+        if denom <= 0:
+            return None
+        return float(pnl) / denom
+
     def run(self, df: pd.DataFrame, intents_by_bar: List[List[OrderIntent]]) -> List[Trade]:
         trades: List[Trade] = []
 
@@ -122,7 +175,32 @@ class SimpleBarEngine:
         pending_intent: Optional[OrderIntent] = None
         pending_tag: str = ""
 
+        # Guardrails state (UTC-day scoped)
+        current_day: Optional[str] = None
+        entries_today: int = 0
+        realized_R_today: float = 0.0
+        stopped_today: bool = False
+
+        # Cooldown state (bar-index scoped)
+        cooldown_until_index: int = 0
+
+        # Counters for audit
+        n_blocked_by_daily_stop: int = 0
+        n_blocked_by_max_trades: int = 0
+        n_blocked_by_cooldown: int = 0
+
         for i, (ts, row) in enumerate(df.iterrows()):
+            day_key = self._utc_day_key(ts)
+
+            # Day rollover resets daily guardrails
+            if current_day is None:
+                current_day = day_key
+            elif day_key != current_day:
+                current_day = day_key
+                entries_today = 0
+                realized_R_today = 0.0
+                stopped_today = False
+
             o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
 
             # Fill pending entry at this bar open
@@ -143,6 +221,9 @@ class SimpleBarEngine:
                 tag = pending_tag
                 pending_intent = None
                 pending_tag = ""
+
+                # Count entry (for max trades/day)
+                entries_today += 1
 
             # Manage existing position
             if pos_side is not None and entry_time is not None:
@@ -182,23 +263,36 @@ class SimpleBarEngine:
 
                     pnl = self._apply_costs(raw_pnl, pos_qty)
 
-                    trades.append(
-                        Trade(
-                            entry_time=entry_time,
-                            exit_time=ts,
-                            side=pos_side,
-                            qty=pos_qty,
-                            entry_price=float(entry_price),
-                            exit_price=float(exit_fill),
-                            pnl=float(pnl),
-                            tag=tag,
-                            exit_reason=exit_reason,
-                            sl_price=pos_sl_price,
-                            tp_price=pos_tp_price,
-                            risk_price=pos_risk_price,
-                        )
+                    trade = Trade(
+                        entry_time=entry_time,
+                        exit_time=ts,
+                        side=pos_side,
+                        qty=pos_qty,
+                        entry_price=float(entry_price),
+                        exit_price=float(exit_fill),
+                        pnl=float(pnl),
+                        tag=tag,
+                        exit_reason=exit_reason,
+                        sl_price=pos_sl_price,
+                        tp_price=pos_tp_price,
+                        risk_price=pos_risk_price,
                     )
+                    trades.append(trade)
 
+                    # Update realized R today (daily stop uses realized R of exits)
+                    r_mult = self._safe_r_multiple(trade.pnl, trade.risk_price, trade.qty)
+                    if r_mult is not None:
+                        realized_R_today += float(r_mult)
+
+                    # Apply daily stop if configured
+                    if (self.max_daily_loss_R is not None) and (realized_R_today <= -abs(float(self.max_daily_loss_R))):
+                        stopped_today = True
+
+                    # Start cooldown window after exit
+                    if self.cooldown_bars > 0:
+                        cooldown_until_index = max(cooldown_until_index, i + self.cooldown_bars + 1)
+
+                    # Reset position
                     pos_side = None
                     pos_qty = 0.0
                     entry_price = 0.0
@@ -210,16 +304,39 @@ class SimpleBarEngine:
                     pos_tp_price = None
                     pos_risk_price = None
 
-            # Schedule / fill entries
+            # Schedule / fill entries (only if flat and no pending)
             if pos_side is None and pending_intent is None:
                 intents = intents_by_bar[i] if i < len(intents_by_bar) else []
                 if intents:
                     intent = intents[0]
 
+                    # ---- Guardrails gate (entries only) ----
+                    blocked = False
+
+                    # Daily stop gate
+                    if stopped_today:
+                        n_blocked_by_daily_stop += 1
+                        blocked = True
+
+                    # Max trades/day gate (count entries; note pending fill also increments when filled)
+                    if (not blocked) and (self.max_trades_per_day is not None) and (entries_today >= int(self.max_trades_per_day)):
+                        n_blocked_by_max_trades += 1
+                        blocked = True
+
+                    # Cooldown gate
+                    if (not blocked) and (i < cooldown_until_index):
+                        n_blocked_by_cooldown += 1
+                        blocked = True
+
+                    if blocked:
+                        continue
+
+                    # ---- Proceed with entry scheduling/fill ----
                     if self.fill_mode == "next_open":
                         if i < len(df) - 1:
                             pending_intent = intent
                             pending_tag = intent.tag
+                        # If last bar, ignore (cannot fill next open)
                     else:
                         pos_side = intent.side
                         pos_qty = float(intent.qty)
@@ -234,5 +351,26 @@ class SimpleBarEngine:
                         pos_risk_price = abs(float(entry_price) - float(sl)) if (sl is not None) else None
 
                         tag = intent.tag
+
+                        # Count entry immediately (close fill)
+                        entries_today += 1
+
+        # Expose risk/guardrails report for orchestrator persistence
+        self.last_risk_report = {
+            "risk_cfg": {
+                "max_daily_loss_R": self.max_daily_loss_R,
+                "max_trades_per_day": self.max_trades_per_day,
+                "cooldown_bars": self.cooldown_bars,
+            },
+            "final_day_key_utc": current_day,
+            "final_entries_today": entries_today,
+            "final_realized_R_today": realized_R_today,
+            "final_stopped_today": stopped_today,
+            "blocked": {
+                "by_daily_stop": n_blocked_by_daily_stop,
+                "by_max_trades_per_day": n_blocked_by_max_trades,
+                "by_cooldown": n_blocked_by_cooldown,
+            },
+        }
 
         return trades

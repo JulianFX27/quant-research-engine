@@ -28,6 +28,20 @@ LEADERBOARD_COLUMNS: List[str] = [
     "symbol",
     "timeframe",
     "strategy_name",
+    # Dataset identity (traceability)
+    "dataset_id",
+    "dataset_rows",
+    "dataset_start_time_utc",
+    "dataset_end_time_utc",
+    # Risk policy (guardrails) - flat metrics
+    "risk_max_daily_loss_R",
+    "risk_max_trades_per_day",
+    "risk_cooldown_bars",
+    "risk_blocked_by_daily_stop",
+    "risk_blocked_by_max_trades_per_day",
+    "risk_blocked_by_cooldown",
+    "risk_final_realized_R_today",
+    "risk_final_stopped_today",
     # Core metrics (PnL space)
     "n_trades",
     "total_pnl",
@@ -113,6 +127,20 @@ def _row_from_result(r: Dict[str, Any]) -> Dict[str, Any]:
         "symbol": r.get("symbol"),
         "timeframe": r.get("timeframe"),
         "strategy_name": r.get("strategy_name"),
+        # Dataset (traceability)
+        "dataset_id": m.get("dataset_id"),
+        "dataset_rows": m.get("dataset_rows"),
+        "dataset_start_time_utc": m.get("dataset_start_time_utc"),
+        "dataset_end_time_utc": m.get("dataset_end_time_utc"),
+        # Risk policy (guardrails)
+        "risk_max_daily_loss_R": m.get("risk_max_daily_loss_R"),
+        "risk_max_trades_per_day": m.get("risk_max_trades_per_day"),
+        "risk_cooldown_bars": m.get("risk_cooldown_bars"),
+        "risk_blocked_by_daily_stop": m.get("risk_blocked_by_daily_stop"),
+        "risk_blocked_by_max_trades_per_day": m.get("risk_blocked_by_max_trades_per_day"),
+        "risk_blocked_by_cooldown": m.get("risk_blocked_by_cooldown"),
+        "risk_final_realized_R_today": m.get("risk_final_realized_R_today"),
+        "risk_final_stopped_today": m.get("risk_final_stopped_today"),
         # Core
         "n_trades": m.get("n_trades"),
         "total_pnl": m.get("total_pnl"),
@@ -149,6 +177,7 @@ def _row_from_result(r: Dict[str, Any]) -> Dict[str, Any]:
         "equity_path": outs.get("equity"),
     }
 
+    # Ensure schema stability
     for col in LEADERBOARD_COLUMNS:
         row.setdefault(col, None)
     return row

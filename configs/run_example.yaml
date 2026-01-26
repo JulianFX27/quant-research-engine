@@ -17,10 +17,18 @@ strategy:
 
 execution:
   fill_mode: next_open          # close | next_open
-  intrabar_path: OHL C          # "OHLC" | "OLHC" (spaces ignored)
+  intrabar_path: OHLC           # "OHLC" | "OLHC"
   intrabar_tie: sl_first        # fallback if needed
 
 costs:
   commission: 0.0
   spread_pips: 1.0
   slippage_pips: 0.0
+
+risk:
+  # Stop trading for the rest of the UTC day once realized_R_today <= -max_daily_loss_R
+  max_daily_loss_R: 2.0
+  # Maximum entries per UTC day
+  max_trades_per_day: 2
+  # After a trade exits, wait N bars before allowing a new entry
+  cooldown_bars: 3

@@ -71,7 +71,8 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     run_dir = out_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    df = load_bars_csv(cfg["data_path"])
+    # Load bars + dataset fingerprint (identity & integrity)
+    df, dataset_fp = load_bars_csv(cfg["data_path"], return_fingerprint=True)
 
     strat_cfg = cfg["strategy"]
     strategy = make_strategy(strat_cfg["name"], strat_cfg.get("params", {}))
@@ -95,12 +96,38 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
         if "slippage_pips" in costs and "slippage_price" not in costs:
             costs["slippage_price"] = float(costs.get("slippage_pips", 0.0)) * pip_size
 
-    engine = SimpleBarEngine(costs=costs, exec_cfg=cfg.get("execution", {}))
+    # Guardrails / risk policy layer
+    risk_cfg = cfg.get("risk", {}) or {}
+
+    engine = SimpleBarEngine(costs=costs, exec_cfg=cfg.get("execution", {}), risk_cfg=risk_cfg)
     trades = engine.run(df, intents_by_bar)
+
+    # Risk report from engine (auditability)
+    risk_report = getattr(engine, "last_risk_report", {}) or {}
+    blocked = (risk_report.get("blocked") or {})
+    risk_cfg_resolved = (risk_report.get("risk_cfg") or risk_cfg or {})
 
     metrics_raw = summarize_trades(trades)
     pf = metrics_raw.get("profit_factor")
     metrics_raw["profit_factor_is_inf"] = isinstance(pf, float) and (not math.isfinite(pf))
+
+    # Dataset identity fields (flat) for quick traceability/leaderboard
+    metrics_raw["dataset_id"] = getattr(dataset_fp, "dataset_id", None)
+    metrics_raw["dataset_rows"] = getattr(dataset_fp, "rows", None)
+    metrics_raw["dataset_start_time_utc"] = getattr(dataset_fp, "start_time_utc", None)
+    metrics_raw["dataset_end_time_utc"] = getattr(dataset_fp, "end_time_utc", None)
+
+    # Risk (flat) for leaderboard / quick inspection
+    metrics_raw["risk_max_daily_loss_R"] = risk_cfg_resolved.get("max_daily_loss_R")
+    metrics_raw["risk_max_trades_per_day"] = risk_cfg_resolved.get("max_trades_per_day")
+    metrics_raw["risk_cooldown_bars"] = risk_cfg_resolved.get("cooldown_bars")
+
+    metrics_raw["risk_blocked_by_daily_stop"] = blocked.get("by_daily_stop")
+    metrics_raw["risk_blocked_by_max_trades_per_day"] = blocked.get("by_max_trades_per_day")
+    metrics_raw["risk_blocked_by_cooldown"] = blocked.get("by_cooldown")
+    metrics_raw["risk_final_realized_R_today"] = risk_report.get("final_realized_R_today")
+    metrics_raw["risk_final_stopped_today"] = risk_report.get("final_stopped_today")
+
     metrics = _sanitize_for_json(metrics_raw)
 
     # Persist trades
@@ -134,6 +161,9 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
             "spread_price": float(costs.get("spread_price", 0.0)),
             "slippage_price": float(costs.get("slippage_price", 0.0)),
         },
+        "risk": risk_cfg,
+        "risk_report": risk_report,
+        "dataset": (dataset_fp.to_dict() if hasattr(dataset_fp, "to_dict") else None),
         "outputs": {
             "run_dir": str(run_dir),
             "trades": str(trades_path),
@@ -146,6 +176,11 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
 
     return {
         "metrics": metrics,
-        "outputs": {"run_dir": str(run_dir), "trades": str(trades_path), "equity": str(equity_path), "metrics": str(metrics_path)},
+        "outputs": {
+            "run_dir": str(run_dir),
+            "trades": str(trades_path),
+            "equity": str(equity_path),
+            "metrics": str(metrics_path),
+        },
         "run_id": run_id,
     }
