@@ -11,6 +11,7 @@ import pandas as pd
 
 from backtester.core.config import validate_run_config
 from backtester.data.loader import load_bars_csv
+from backtester.data.dataset_fingerprint import build_dataset_id
 from backtester.execution.engine import SimpleBarEngine
 from backtester.metrics.basic import summarize_trades, trades_to_dicts
 from backtester.strategies.registry import make_strategy
@@ -71,8 +72,31 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     run_dir = out_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
-    # Load bars + dataset fingerprint (identity & integrity)
-    df, dataset_fp = load_bars_csv(cfg["data_path"], return_fingerprint=True)
+    instrument = cfg.get("instrument", {}) or {}
+    symbol = str(cfg.get("symbol") or "UNKNOWN")
+    timeframe = str(cfg.get("timeframe") or "UNKNOWN")
+    source = str(instrument.get("data_source") or instrument.get("source") or "csv")
+
+    # Provisional dataset_id (will be aligned after load using real start/end)
+    dataset_id_prov = build_dataset_id(
+        instrument=symbol,
+        timeframe=timeframe,
+        start_ts="unknown",
+        end_ts="unknown",
+        source=source,
+    )
+
+    # Load bars + dataset metadata (identity & integrity)
+    df, dataset_meta = load_bars_csv(cfg["data_path"], return_fingerprint=True, dataset_id=dataset_id_prov)
+
+    # Align dataset_id with real start/end (post-normalization)
+    dataset_id_final = build_dataset_id(
+        instrument=symbol,
+        timeframe=timeframe,
+        start_ts=str(dataset_meta.start_ts),
+        end_ts=str(dataset_meta.end_ts),
+        source=source,
+    )
 
     strat_cfg = cfg["strategy"]
     strategy = make_strategy(strat_cfg["name"], strat_cfg.get("params", {}))
@@ -88,7 +112,6 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
 
     # Resolve pip-based costs into price units for the engine
     costs = dict(cfg.get("costs", {}))
-    instrument = cfg.get("instrument", {}) or {}
     pip_size = float(instrument.get("pip_size", 0.0) or 0.0)
     if pip_size > 0:
         if "spread_pips" in costs and "spread_price" not in costs:
@@ -112,10 +135,11 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_raw["profit_factor_is_inf"] = isinstance(pf, float) and (not math.isfinite(pf))
 
     # Dataset identity fields (flat) for quick traceability/leaderboard
-    metrics_raw["dataset_id"] = getattr(dataset_fp, "dataset_id", None)
-    metrics_raw["dataset_rows"] = getattr(dataset_fp, "rows", None)
-    metrics_raw["dataset_start_time_utc"] = getattr(dataset_fp, "start_time_utc", None)
-    metrics_raw["dataset_end_time_utc"] = getattr(dataset_fp, "end_time_utc", None)
+    metrics_raw["dataset_id"] = dataset_id_final
+    metrics_raw["dataset_fp8"] = dataset_meta.fingerprint_short
+    metrics_raw["dataset_rows"] = dataset_meta.rows
+    metrics_raw["dataset_start_time_utc"] = dataset_meta.start_ts
+    metrics_raw["dataset_end_time_utc"] = dataset_meta.end_ts
 
     # Risk (flat) for leaderboard / quick inspection
     metrics_raw["risk_max_daily_loss_R"] = risk_cfg_resolved.get("max_daily_loss_R")
@@ -145,6 +169,11 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_path.write_text(json.dumps(metrics, indent=2))
 
     started_at_utc = datetime.now(timezone.utc).isoformat()
+
+    # Persist dataset metadata (full)
+    dataset_dict = dataset_meta.to_dict()
+    dataset_dict["dataset_id"] = dataset_id_final  # enforce aligned id
+
     manifest = {
         "run_id": run_id,
         "started_at_utc": started_at_utc,
@@ -163,7 +192,7 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
         },
         "risk": risk_cfg,
         "risk_report": risk_report,
-        "dataset": (dataset_fp.to_dict() if hasattr(dataset_fp, "to_dict") else None),
+        "dataset": dataset_dict,
         "outputs": {
             "run_dir": str(run_dir),
             "trades": str(trades_path),

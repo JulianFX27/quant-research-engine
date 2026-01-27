@@ -6,7 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import yaml
@@ -20,6 +20,9 @@ class BatchItem:
 
 
 LEADERBOARD_COLUMNS: List[str] = [
+    # Batch identity
+    "batch_id",
+    "dataset_compat",
     # Identity
     "status",
     "config_path",
@@ -30,6 +33,7 @@ LEADERBOARD_COLUMNS: List[str] = [
     "strategy_name",
     # Dataset identity (traceability)
     "dataset_id",
+    "dataset_fp8",
     "dataset_rows",
     "dataset_start_time_utc",
     "dataset_end_time_utc",
@@ -115,11 +119,42 @@ def _normalize_status(s: Any) -> str:
     return s2 if s2 in {"ok", "error"} else "error"
 
 
-def _row_from_result(r: Dict[str, Any]) -> Dict[str, Any]:
+def _norm_fp8(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s if s else None
+
+
+def _compute_dataset_compat(rows: List[Dict[str, Any]]) -> str:
+    """
+    Dataset compatibility for the batch.
+    - OK: all non-null dataset_fp8 values are identical and at least one exists
+    - MIXED: more than one distinct non-null dataset_fp8 exists
+    - UNKNOWN: no dataset_fp8 available at all
+    """
+    fps = []
+    for r in rows:
+        fp = _norm_fp8(r.get("dataset_fp8"))
+        if fp:
+            fps.append(fp)
+    uniq = sorted(set(fps))
+    if len(uniq) == 0:
+        return "UNKNOWN"
+    if len(uniq) == 1:
+        return "OK"
+    return "MIXED"
+
+
+def _row_from_result(r: Dict[str, Any], batch_id: str, dataset_compat: str) -> Dict[str, Any]:
     m = r.get("metrics", {}) or {}
     outs = r.get("outputs", {}) or {}
 
     row: Dict[str, Any] = {
+        # Batch fields
+        "batch_id": batch_id,
+        "dataset_compat": dataset_compat,
+        # Identity
         "status": _normalize_status(r.get("status", "ok")),
         "config_path": r.get("config_path"),
         "run_id": r.get("run_id"),
@@ -129,6 +164,7 @@ def _row_from_result(r: Dict[str, Any]) -> Dict[str, Any]:
         "strategy_name": r.get("strategy_name"),
         # Dataset (traceability)
         "dataset_id": m.get("dataset_id"),
+        "dataset_fp8": m.get("dataset_fp8"),
         "dataset_rows": m.get("dataset_rows"),
         "dataset_start_time_utc": m.get("dataset_start_time_utc"),
         "dataset_end_time_utc": m.get("dataset_end_time_utc"),
@@ -220,7 +256,17 @@ def main() -> None:
             except Exception as e:
                 errors.append({"config_path": cp, "error": repr(e)})
 
-    rows: List[Dict[str, Any]] = [_row_from_result(r) for r in results]
+    # Compute dataset compatibility based on successful runs first
+    # (errors don't contribute dataset fingerprints)
+    # We'll compute once and stamp into all rows.
+    # Build provisional rows with minimal dataset_fp8 to evaluate compat.
+    provisional_rows: List[Dict[str, Any]] = []
+    for r in results:
+        m = r.get("metrics", {}) or {}
+        provisional_rows.append({"dataset_fp8": m.get("dataset_fp8")})
+    dataset_compat = _compute_dataset_compat(provisional_rows)
+
+    rows: List[Dict[str, Any]] = [_row_from_result(r, batch_id=batch_id, dataset_compat=dataset_compat) for r in results]
 
     for er in errors:
         rows.append(
@@ -235,7 +281,9 @@ def main() -> None:
                     "symbol": None,
                     "timeframe": None,
                     "strategy_name": None,
-                }
+                },
+                batch_id=batch_id,
+                dataset_compat=dataset_compat,
             )
         )
 
@@ -260,6 +308,7 @@ def main() -> None:
         "jobs": args.jobs,
         "out_root": out_root,
         "leaderboard_csv": str(leaderboard_path),
+        "dataset_compat": dataset_compat,
         "n_configs": len(config_paths),
         "n_success": len(results),
         "n_errors": len(errors),
@@ -268,6 +317,7 @@ def main() -> None:
     manifest_path.write_text(json.dumps(batch_manifest, indent=2))
 
     print("Batch done.")
+    print(f"Dataset compat: {dataset_compat}")
     print(f"Leaderboard: {leaderboard_path}")
     if errors:
         print(f"Errors: {len(errors)} (see {manifest_path})")
