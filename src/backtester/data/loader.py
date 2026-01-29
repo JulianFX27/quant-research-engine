@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional, Tuple, Union
 
 import pandas as pd
+
+from backtester.data.dataset_fingerprint import DatasetMetadata, build_dataset_metadata
 
 
 _REQUIRED_COLS: List[str] = ["time", "open", "high", "low", "close"]
@@ -23,12 +25,12 @@ def _coerce_numeric(df: pd.DataFrame, cols: Iterable[str]) -> None:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         except Exception:
             bad.append(c)
+
     if bad:
         raise ValueError(f"Failed to coerce columns to numeric: {bad}")
 
     nan_cols = [c for c in cols if df[c].isna().any()]
     if nan_cols:
-        # Show a small sample of offending rows for debugging
         sample = df[df[nan_cols].isna().any(axis=1)].head(5)
         raise ValueError(
             "Found non-numeric / missing values after coercion in columns: "
@@ -59,7 +61,12 @@ def _validate_ohlc_integrity(df: pd.DataFrame) -> None:
         )
 
 
-def load_bars_csv(path: str) -> pd.DataFrame:
+def load_bars_csv(
+    path: str,
+    *,
+    return_fingerprint: bool = False,
+    dataset_id: Optional[str] = None,
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, DatasetMetadata]]:
     """
     Load normalized OHLCV bars.
 
@@ -76,6 +83,10 @@ def load_bars_csv(path: str) -> pd.DataFrame:
       - Sorted ascending by time
       - No duplicate timestamps (duplicates raise error to avoid silent data issues)
       - Canonical columns kept: open, high, low, close, volume?, spread?
+
+    If return_fingerprint=True:
+      - requires dataset_id
+      - returns (df, DatasetMetadata) computed from canonical time+OHLC representation
     """
     p = Path(path)
     if not p.exists():
@@ -86,7 +97,6 @@ def load_bars_csv(path: str) -> pd.DataFrame:
     _ensure_columns(df, _REQUIRED_COLS)
 
     # Parse time -> UTC
-    # If input is timezone-naive, pandas with utc=True assumes it's UTC; that's acceptable for our contract.
     df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
     if df["time"].isna().any():
         sample = df[df["time"].isna()].head(5)
@@ -98,7 +108,7 @@ def load_bars_csv(path: str) -> pd.DataFrame:
     # Sort
     df = df.sort_values("time")
 
-    # Duplicates: raise (prefer explicit data cleaning over silent dropping)
+    # Duplicates: raise
     dup_mask = df["time"].duplicated(keep=False)
     if dup_mask.any():
         sample = df.loc[dup_mask, ["time"]].head(10)
@@ -121,4 +131,22 @@ def load_bars_csv(path: str) -> pd.DataFrame:
 
     # Keep canonical columns only
     keep = ["open", "high", "low", "close"] + [c for c in _OPTIONAL_COLS if c in df.columns]
-    return df[keep].copy()
+    df_out = df[keep].copy()
+
+    if not return_fingerprint:
+        return df_out
+
+    if not dataset_id:
+        raise ValueError("dataset_id is required when return_fingerprint=True")
+
+    dataset_meta = build_dataset_metadata(
+        df_out,
+        dataset_id=dataset_id,
+        source_path=str(p),
+        include_file_hash=True,
+        time_col=None,  # will infer __index__ because index.name == "time"
+        price_cols=("open", "high", "low", "close"),
+        sort_by_time=True,
+    )
+
+    return df_out, dataset_meta
