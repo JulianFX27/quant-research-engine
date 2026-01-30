@@ -1,9 +1,9 @@
 .PHONY: smoke test
 
+PYTEST ?= pytest
+
 smoke:
-	python -m pip install -q pytest
-	pytest -q
+	$(PYTEST) -q
 
 test:
-	pytest
-
+	$(PYTEST)

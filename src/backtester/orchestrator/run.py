@@ -70,7 +70,7 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
 
     Design:
       - loader may require a dataset_id; we pass provisional to compute metadata
-      - then we compute dataset_id_final from canonical start/end and rebind meta
+      - then compute dataset_id_final from canonical start/end and rebind meta
       - only dataset_id_final is ever registered
     """
     instrument = cfg.get("instrument", {}) or {}
@@ -102,10 +102,16 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
 
     dataset_meta_final = replace(dataset_meta, dataset_id=dataset_id_final)
 
+    # Dataset registry policy (YAML-controlled)
+    dsreg = cfg.get("dataset_registry", {}) or {}
+    allow_override = bool(dsreg.get("allow_override", False))
+    override_reason = str(dsreg.get("override_reason", "") or "")
+
     register_or_validate_dataset(
         dataset_meta_final,
         registry_dir="data/registry",
-        allow_new_fingerprint=False,
+        allow_new_fingerprint=allow_override,
+        override_reason=override_reason,
     )
 
     return df, dataset_meta_final, dataset_id_final
@@ -121,8 +127,9 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     run_dir = out_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
+    started_at_utc = datetime.now(timezone.utc).isoformat()
+
     instrument = cfg.get("instrument", {}) or {}
-    symbol = str(cfg.get("symbol") or "UNKNOWN")
 
     # Load + dataset registry (global)
     df, dataset_meta, dataset_id_final = _load_bars_and_register_dataset(cfg)
@@ -134,7 +141,7 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     context = {
         "symbol": cfg["symbol"],
         "timeframe": cfg["timeframe"],
-        "instrument": cfg.get("instrument", {}),
+        "instrument": instrument,
     }
     for i in range(len(df)):
         intents_by_bar.append(strategy.on_bar(i, df, context))
@@ -187,6 +194,23 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_raw["risk_final_realized_R_today"] = risk_report.get("final_realized_R_today")
     metrics_raw["risk_final_stopped_today"] = risk_report.get("final_stopped_today")
 
+    # Guardrails v2 summary into metrics (optional but useful)
+    gr = (risk_report.get("guardrails") or {})
+    gr_cfg = (gr.get("guardrails_cfg") or {})
+    gr_blocked = (gr.get("blocked") or {})
+    gr_forced = (gr.get("forced_exits") or {})
+
+    metrics_raw["gr_time_window_enabled"] = gr_cfg.get("time_window_enabled")
+    metrics_raw["gr_window_start_utc"] = gr_cfg.get("window_start_utc")
+    metrics_raw["gr_window_end_utc"] = gr_cfg.get("window_end_utc")
+    metrics_raw["gr_max_concurrent_positions"] = gr_cfg.get("max_concurrent_positions")
+    metrics_raw["gr_max_holding_bars"] = gr_cfg.get("max_holding_bars")
+
+    # Optional counters (useful for audit & leaderboard)
+    metrics_raw["gr_blocked_by_max_concurrent_positions"] = gr_blocked.get("by_max_concurrent_positions")
+    metrics_raw["gr_blocked_by_time_window"] = gr_blocked.get("by_time_window")
+    metrics_raw["gr_forced_exit_by_max_holding_bars"] = gr_forced.get("by_max_holding_bars")
+
     metrics = _sanitize_for_json(metrics_raw)
 
     # Persist trades
@@ -203,8 +227,6 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-    started_at_utc = datetime.now(timezone.utc).isoformat()
-
     # Persist dataset metadata (full) — enforce dataset_id_final explicitly
     dataset_dict = dataset_meta.to_dict()
     dataset_dict["dataset_id"] = dataset_id_final
@@ -217,6 +239,7 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
         "timeframe": cfg["timeframe"],
         "data_path": cfg["data_path"],
         "instrument": cfg.get("instrument", {}),
+        "dataset_registry": cfg.get("dataset_registry", {}) or {},
         "strategy": cfg["strategy"],
         "execution": cfg.get("execution", {}),
         "costs": cfg.get("costs", {}),

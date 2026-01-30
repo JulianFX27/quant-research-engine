@@ -1,0 +1,22 @@
+{
+  "EURUSD_M5_2026-01-01__2026-01-02__csv_example": {
+    "dataset_id": "EURUSD_M5_2026-01-01__2026-01-02__csv_example",
+    "end_ts": "2026-01-02T00:55:00+00:00",
+    "file_bytes": 18489,
+    "file_sha256": "sha256:87d8e5e635232d16317e57f9e092318cc588ec1da31a5ff4b57639818200cdcd",
+    "fingerprint_sha256": "sha256:1806646f96d3f3c4e924a06da1558f1d975c185e5fb22284e33d77d94e3fa417",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-01-30T22:40:07.221137+00:00",
+    "rows": 300,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/example_bars.csv",
+    "start_ts": "2026-01-01T00:00:00+00:00",
+    "time_col": "__index__"
+  }
+}

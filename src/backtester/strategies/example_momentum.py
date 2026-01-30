@@ -11,7 +11,7 @@ from backtester.strategies.base import Strategy
 class ExampleMomentum(Strategy):
     """Toy example: if close > SMA(n) -> buy; if close < SMA(n) -> sell.
 
-    This is only a scaffold to prove wiring end-to-end.
+    Scaffold to prove wiring end-to-end.
     """
 
     def on_bar(self, i: int, df, context: Dict[str, Any]) -> List[OrderIntent]:
@@ -19,7 +19,13 @@ class ExampleMomentum(Strategy):
         qty = float(self.params.get("qty", 1.0))
         sl_pips = float(self.params.get("sl_pips", 10))
         tp_pips = float(self.params.get("tp_pips", 20))
-        pip = float(self.params.get("pip", 0.0001))
+
+        instrument = (context.get("instrument") or {})
+        pip_size = float(instrument.get("pip_size", 0.0) or 0.0)
+        if pip_size <= 0:
+            # config.py already enforces pip_size when sl_pips/tp_pips are present,
+            # but keep this guard to prevent silent wrong pricing.
+            raise ValueError("ExampleMomentum requires instrument.pip_size > 0 when using sl_pips/tp_pips")
 
         if i < max(self.warmup_bars, n):
             return []
@@ -32,19 +38,21 @@ class ExampleMomentum(Strategy):
                 OrderIntent(
                     side="BUY",
                     qty=qty,
-                    sl_price=close - sl_pips * pip,
-                    tp_price=close + tp_pips * pip,
+                    sl_price=close - sl_pips * pip_size,
+                    tp_price=close + tp_pips * pip_size,
                     tag=f"sma{n}_long",
                 )
             ]
+
         if close < sma:
             return [
                 OrderIntent(
                     side="SELL",
                     qty=qty,
-                    sl_price=close + sl_pips * pip,
-                    tp_price=close - tp_pips * pip,
+                    sl_price=close + sl_pips * pip_size,
+                    tp_price=close - tp_pips * pip_size,
                     tag=f"sma{n}_short",
                 )
             ]
+
         return []

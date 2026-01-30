@@ -60,6 +60,7 @@ def register_or_validate_dataset(
     *,
     registry_dir: str | Path = "data/registry",
     allow_new_fingerprint: bool = False,
+    override_reason: str = "",
     append_match_event: bool = False,
 ) -> Tuple[bool, Optional[str]]:
     """
@@ -69,10 +70,11 @@ def register_or_validate_dataset(
     Policy:
       - dataset_id is a semantic identity (instrument/timeframe/start/end/source, etc.)
       - dataset_id MUST map to a stable content fingerprint (fingerprint_sha256)
-      - if dataset_id exists and fingerprint differs -> error unless allow_new_fingerprint=True
+      - if dataset_id exists and fingerprint differs -> error unless allow_new_fingerprint=True (override)
 
     Notes:
       - append_match_event: if True, also appends MATCH events to datasets.jsonl for full audit trails.
+      - override_reason required if allow_new_fingerprint=True
     """
     dsid = meta.dataset_id
     _assert_dataset_id_is_final(dsid)
@@ -115,8 +117,24 @@ def register_or_validate_dataset(
     if not allow_new_fingerprint:
         raise DatasetIdentityError(msg)
 
+    # Override requires reason (contract-stable error string)
+    if not str(override_reason or "").strip():
+        raise DatasetIdentityError(
+            "DATASET_ID_OVERRIDE_REASON_REQUIRED: override requested but override_reason is empty.\n"
+            f"dataset_id={dsid}\n"
+            "Fix: set dataset_registry.override_reason to a non-empty string.\n"
+        )
+
     # allowed override: update latest snapshot + append audit
     latest[dsid] = record
     _write_latest_map(latest_path, latest)
-    _append_jsonl(jsonl_path, {"event": "UPDATE_FINGERPRINT_ALLOWED", "prev": prev, "new": record})
+    _append_jsonl(
+        jsonl_path,
+        {
+            "event": "UPDATE_FINGERPRINT_ALLOWED",
+            "override_reason": str(override_reason),
+            "prev": prev,
+            "new": record,
+        },
+    )
     return False, "fingerprint mismatch but override allowed; registry updated"

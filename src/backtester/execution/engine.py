@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from backtester.core.contracts import OrderIntent
+from backtester.risk.guardrails import Guardrails
 
 
 @dataclass
@@ -19,7 +20,6 @@ class Trade:
     pnl: float
     tag: str
     exit_reason: str
-
 
     # Persist SL/TP used for this trade (if available) so research metrics can compute R
     sl_price: float | None = None
@@ -53,6 +53,11 @@ class SimpleBarEngine:
           Limit number of entries per UTC day.
       - cooldown_bars: int
           After a trade exits, block new entries until i >= cooldown_until_index.
+
+    Guardrails v2 (via backtester.risk.guardrails.Guardrails):
+      - max_concurrent_positions (engine supports only 1 today; >1 is refused)
+      - time_window_enabled + window_start_utc/window_end_utc (UTC)
+      - max_holding_bars (force exit at close if still open and not exited via SL/TP intrabar)
     """
 
     def __init__(self, *, costs: Dict[str, Any], exec_cfg: Dict[str, Any], risk_cfg: Optional[Dict[str, Any]] = None):
@@ -75,6 +80,18 @@ class SimpleBarEngine:
         self.cooldown_bars: int = int(risk_cfg.get("cooldown_bars", 0) or 0)
         if self.cooldown_bars < 0:
             self.cooldown_bars = 0
+
+        # Guardrails v2
+        self.guardrails = Guardrails(risk_cfg)
+
+        # Engine is single-position today. Refuse configs that claim otherwise.
+        mcp = int((risk_cfg or {}).get("max_concurrent_positions", 1) or 1)
+        if mcp != 1:
+            raise ValueError(
+                "ENGINE_SINGLE_POSITION_ONLY: max_concurrent_positions must be 1 for SimpleBarEngine.\n"
+                f"got max_concurrent_positions={mcp}\n"
+                "Fix: set risk.max_concurrent_positions: 1 (or implement multi-position engine).\n"
+            )
 
         # Exposed after run() for persistence/audit (orchestrator can copy into metrics/manifest)
         self.last_risk_report: Dict[str, Any] = {}
@@ -164,6 +181,7 @@ class SimpleBarEngine:
         pos_qty: float = 0.0
         entry_price: float = 0.0
         entry_time: Optional[pd.Timestamp] = None
+        entry_index: Optional[int] = None
         sl: Optional[float] = None
         tp: Optional[float] = None
         tag: str = ""
@@ -184,7 +202,7 @@ class SimpleBarEngine:
         # Cooldown state (bar-index scoped)
         cooldown_until_index: int = 0
 
-        # Counters for audit
+        # Counters for audit (legacy v1)
         n_blocked_by_daily_stop: int = 0
         n_blocked_by_max_trades: int = 0
         n_blocked_by_cooldown: int = 0
@@ -209,6 +227,7 @@ class SimpleBarEngine:
                 pos_qty = float(pending_intent.qty)
                 entry_price = self._fill_entry(o, pos_side)
                 entry_time = ts
+                entry_index = i
 
                 sl = float(pending_intent.sl_price) if pending_intent.sl_price is not None else None
                 tp = float(pending_intent.tp_price) if pending_intent.tp_price is not None else None
@@ -226,7 +245,7 @@ class SimpleBarEngine:
                 entries_today += 1
 
             # Manage existing position
-            if pos_side is not None and entry_time is not None:
+            if pos_side is not None and entry_time is not None and entry_index is not None:
                 exit_reason: Optional[str] = None
                 exit_level: Optional[float] = None
 
@@ -252,6 +271,14 @@ class SimpleBarEngine:
                             exit_reason, exit_level = "TP", float(tp)
                         else:
                             exit_reason, exit_level = "SL", float(sl)
+
+                # If not exited via SL/TP, apply max_holding_bars force-exit at close
+                if exit_reason is None:
+                    holding_bars = i - int(entry_index)
+                    force, _force_reason = self.guardrails.should_force_exit(holding_bars=holding_bars)
+                    if force:
+                        exit_reason = "FORCE_MAX_HOLD"
+                        exit_level = float(c)  # market close proxy
 
                 if exit_reason is not None and exit_level is not None:
                     exit_fill = self._fill_exit(float(exit_level), pos_side)
@@ -297,6 +324,7 @@ class SimpleBarEngine:
                     pos_qty = 0.0
                     entry_price = 0.0
                     entry_time = None
+                    entry_index = None
                     sl = None
                     tp = None
                     tag = ""
@@ -318,7 +346,7 @@ class SimpleBarEngine:
                         n_blocked_by_daily_stop += 1
                         blocked = True
 
-                    # Max trades/day gate (count entries; note pending fill also increments when filled)
+                    # Max trades/day gate
                     if (not blocked) and (self.max_trades_per_day is not None) and (entries_today >= int(self.max_trades_per_day)):
                         n_blocked_by_max_trades += 1
                         blocked = True
@@ -327,6 +355,30 @@ class SimpleBarEngine:
                     if (not blocked) and (i < cooldown_until_index):
                         n_blocked_by_cooldown += 1
                         blocked = True
+
+                    # Guardrails v2 gate (UTC window + max concurrent positions)
+                    if not blocked:
+                        active_positions = 0  # engine is flat here by construction
+                        if self.fill_mode == "next_open":
+                            # Entry will occur at i+1 open with timestamp df.index[i+1]
+                            if i < len(df) - 1:
+                                entry_ts = df.index[i + 1]
+                                ok, _reason = self.guardrails.allow_entry(
+                                    bar_time_utc=pd.Timestamp(entry_ts),
+                                    active_positions=active_positions,
+                                )
+                                if not ok:
+                                    blocked = True
+                            else:
+                                # last bar cannot fill next_open anyway
+                                blocked = True
+                        else:
+                            ok, _reason = self.guardrails.allow_entry(
+                                bar_time_utc=pd.Timestamp(ts),
+                                active_positions=active_positions,
+                            )
+                            if not ok:
+                                blocked = True
 
                     if blocked:
                         continue
@@ -342,6 +394,7 @@ class SimpleBarEngine:
                         pos_qty = float(intent.qty)
                         entry_price = self._fill_entry(c, pos_side)
                         entry_time = ts
+                        entry_index = i
 
                         sl = float(intent.sl_price) if intent.sl_price is not None else None
                         tp = float(intent.tp_price) if intent.tp_price is not None else None
@@ -361,6 +414,7 @@ class SimpleBarEngine:
                 "max_daily_loss_R": self.max_daily_loss_R,
                 "max_trades_per_day": self.max_trades_per_day,
                 "cooldown_bars": self.cooldown_bars,
+                # guardrails cfg snapshot included separately below
             },
             "final_day_key_utc": current_day,
             "final_entries_today": entries_today,
@@ -371,6 +425,7 @@ class SimpleBarEngine:
                 "by_max_trades_per_day": n_blocked_by_max_trades,
                 "by_cooldown": n_blocked_by_cooldown,
             },
+            "guardrails": self.guardrails.report(),
         }
 
         return trades

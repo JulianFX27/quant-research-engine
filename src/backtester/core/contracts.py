@@ -1,39 +1,39 @@
+# src/backtester/core/contracts.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Literal
-
-
-@dataclass(frozen=True)
-class InstrumentSpec:
-    symbol: str
-    asset_class: Literal["FX", "CRYPTO", "FUTURES", "EQUITY"]
-    timezone: str = "UTC"
-    pip_size: Optional[float] = None
-    tick_size: Optional[float] = None
-    multiplier: float = 1.0
-
-
-@dataclass(frozen=True)
-class Bar:
-    ts_utc: "object"  # pandas.Timestamp, kept generic to avoid hard dep in typing
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float | None = None
-    spread: float | None = None  # optional, in price units
+from typing import Optional
 
 
 @dataclass(frozen=True)
 class OrderIntent:
-    """A minimal intent produced by a strategy.
-
-    Expand later: limit/stop, tif, oco, tags, etc.
     """
+    Strategy -> Engine intent.
 
-    side: Literal["BUY", "SELL"]
+    Contract:
+      - side: "BUY" or "SELL"
+      - qty: position size in units
+      - sl_price / tp_price: absolute price levels (NOT pips)
+      - tag: free-form label for attribution/audit
+    """
+    side: str
     qty: float
-    sl_price: float | None = None
-    tp_price: float | None = None
+    sl_price: Optional[float] = None
+    tp_price: Optional[float] = None
     tag: str = ""
+
+    def __post_init__(self) -> None:
+        s = str(self.side).upper().strip()
+        if s not in ("BUY", "SELL"):
+            raise ValueError(f"Invalid OrderIntent.side: {self.side!r} (expected 'BUY' or 'SELL')")
+        object.__setattr__(self, "side", s)
+
+        q = float(self.qty)
+        if q <= 0:
+            raise ValueError(f"Invalid OrderIntent.qty: {self.qty!r} (must be > 0)")
+
+        # Validate numeric-ness if provided
+        if self.sl_price is not None:
+            float(self.sl_price)
+        if self.tp_price is not None:
+            float(self.tp_price)

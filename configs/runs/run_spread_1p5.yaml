@@ -1,4 +1,4 @@
-name: example_run
+name: example_run_spread_1p5
 symbol: EURUSD
 timeframe: M5
 data_path: data/example_bars.csv
@@ -6,10 +6,6 @@ data_path: data/example_bars.csv
 instrument:
   pip_size: 0.0001
   data_source: csv_example
-
-dataset_registry:
-  allow_override: false
-  override_reason: ""
 
 strategy:
   name: ExampleMomentum
@@ -27,19 +23,10 @@ execution:
 
 costs:
   commission: 0.0
-  spread_pips: 1.0
+  spread_pips: 1.5
   slippage_pips: 0.0
 
 risk:
   max_daily_loss_R: 2.0
   max_trades_per_day: 2
   cooldown_bars: 3
-
-  # Guardrails v2 (UTC)
-  max_concurrent_positions: 1
-
-  time_window_enabled: false
-  window_start_utc: "13:30"   # ejemplo NY open UTC (ajusta si activas)
-  window_end_utc: "16:00"
-
-  max_holding_bars: 0         # 0 = disabled
