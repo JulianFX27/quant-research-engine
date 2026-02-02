@@ -1,8 +1,10 @@
+# src/backtester/orchestrator/run.py
 from __future__ import annotations
 
 import hashlib
 import json
 import math
+import yaml
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +17,7 @@ from backtester.data.dataset_fingerprint import build_dataset_id
 from backtester.data.dataset_registry import register_or_validate_dataset
 from backtester.data.loader import load_bars_csv
 from backtester.execution.engine import SimpleBarEngine
+from backtester.execution.policies import apply_execution_policy
 from backtester.metrics.basic import summarize_trades, trades_to_dicts
 from backtester.strategies.registry import make_strategy
 
@@ -118,37 +121,47 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
 
 
 def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
-    validate_run_config(cfg)
+    # Apply execution policy (Option B) BEFORE validation
+    pol_res = apply_execution_policy(cfg)
+    cfg_resolved = pol_res.cfg_resolved if pol_res is not None else cfg
+
+    validate_run_config(cfg_resolved)
 
     out_root = Path(out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    run_id = _make_run_id(cfg)
+    run_id = _make_run_id(cfg_resolved)
     run_dir = out_root / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
 
     started_at_utc = datetime.now(timezone.utc).isoformat()
 
-    instrument = cfg.get("instrument", {}) or {}
+    instrument = cfg_resolved.get("instrument", {}) or {}
 
     # Load + dataset registry (global)
-    df, dataset_meta, dataset_id_final = _load_bars_and_register_dataset(cfg)
+    df, dataset_meta, dataset_id_final = _load_bars_and_register_dataset(cfg_resolved)
 
-    strat_cfg = cfg["strategy"]
+    strat_cfg = cfg_resolved["strategy"]
     strategy = make_strategy(strat_cfg["name"], strat_cfg.get("params", {}))
 
     intents_by_bar = []
     context = {
-        "symbol": cfg["symbol"],
-        "timeframe": cfg["timeframe"],
+        "symbol": cfg_resolved["symbol"],
+        "timeframe": cfg_resolved["timeframe"],
         "instrument": instrument,
     }
     for i in range(len(df)):
         intents_by_bar.append(strategy.on_bar(i, df, context))
 
     # Resolve pip-based costs into price units for the engine
-    costs = dict(cfg.get("costs", {}))
+    costs_cfg = dict(cfg_resolved.get("costs", {}))
     pip_size = float(instrument.get("pip_size", 0.0) or 0.0)
+
+    # Keep "effective" costs in pips for leaderboard traceability
+    spread_pips_eff = costs_cfg.get("spread_pips")
+    slippage_pips_eff = costs_cfg.get("slippage_pips")
+
+    costs = dict(costs_cfg)
     if pip_size > 0:
         if "spread_pips" in costs and "spread_price" not in costs:
             costs["spread_price"] = float(costs.get("spread_pips", 0.0)) * pip_size
@@ -156,9 +169,9 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
             costs["slippage_price"] = float(costs.get("slippage_pips", 0.0)) * pip_size
 
     # Guardrails / risk policy layer
-    risk_cfg = cfg.get("risk", {}) or {}
+    risk_cfg = cfg_resolved.get("risk", {}) or {}
 
-    engine = SimpleBarEngine(costs=costs, exec_cfg=cfg.get("execution", {}), risk_cfg=risk_cfg)
+    engine = SimpleBarEngine(costs=costs, exec_cfg=cfg_resolved.get("execution", {}), risk_cfg=risk_cfg)
     trades = engine.run(df, intents_by_bar)
 
     # Risk report from engine (auditability)
@@ -169,6 +182,17 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_raw = summarize_trades(trades)
     pf = metrics_raw.get("profit_factor")
     metrics_raw["profit_factor_is_inf"] = isinstance(pf, float) and (not math.isfinite(pf))
+
+    # ---- Execution policy / effective execution ----
+    exe = (cfg_resolved.get("execution", {}) or {})
+    metrics_raw["execution_policy_id"] = (exe.get("policy_id") if isinstance(exe, dict) else None)
+    metrics_raw["execution_fill_mode"] = (exe.get("fill_mode") if isinstance(exe, dict) else None)
+    metrics_raw["execution_intrabar_path"] = (
+        str(exe.get("intrabar_path")).replace(" ", "").upper() if isinstance(exe, dict) and exe.get("intrabar_path") else None
+    )
+    metrics_raw["execution_intrabar_tie"] = (exe.get("intrabar_tie") if isinstance(exe, dict) else None)
+    metrics_raw["costs_spread_pips_effective"] = spread_pips_eff
+    metrics_raw["costs_slippage_pips_effective"] = slippage_pips_eff
 
     # Dataset identity fields (flat) for quick traceability/leaderboard
     metrics_raw["dataset_id"] = dataset_id_final
@@ -206,7 +230,6 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_raw["gr_max_concurrent_positions"] = gr_cfg.get("max_concurrent_positions")
     metrics_raw["gr_max_holding_bars"] = gr_cfg.get("max_holding_bars")
 
-    # Optional counters (useful for audit & leaderboard)
     metrics_raw["gr_blocked_by_max_concurrent_positions"] = gr_blocked.get("by_max_concurrent_positions")
     metrics_raw["gr_blocked_by_time_window"] = gr_blocked.get("by_time_window")
     metrics_raw["gr_forced_exit_by_max_holding_bars"] = gr_forced.get("by_max_holding_bars")
@@ -231,18 +254,29 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     dataset_dict = dataset_meta.to_dict()
     dataset_dict["dataset_id"] = dataset_id_final
 
+    # Persist policy audit block
+    execution_policy_block: Dict[str, Any] | None = None
+    if pol_res is not None:
+        execution_policy_block = {
+            "policy_id": pol_res.policy_id,
+            "policies_path": pol_res.policies_path,
+            "overlay": pol_res.overlay,
+            "warnings": list(pol_res.warnings),
+        }
+
     manifest = {
         "run_id": run_id,
         "started_at_utc": started_at_utc,
-        "name": cfg["name"],
-        "symbol": cfg["symbol"],
-        "timeframe": cfg["timeframe"],
-        "data_path": cfg["data_path"],
-        "instrument": cfg.get("instrument", {}),
-        "dataset_registry": cfg.get("dataset_registry", {}) or {},
-        "strategy": cfg["strategy"],
-        "execution": cfg.get("execution", {}),
-        "costs": cfg.get("costs", {}),
+        "name": cfg_resolved["name"],
+        "symbol": cfg_resolved["symbol"],
+        "timeframe": cfg_resolved["timeframe"],
+        "data_path": cfg_resolved["data_path"],
+        "instrument": cfg_resolved.get("instrument", {}),
+        "dataset_registry": cfg_resolved.get("dataset_registry", {}) or {},
+        "strategy": cfg_resolved["strategy"],
+        "execution": cfg_resolved.get("execution", {}),
+        "execution_policy": execution_policy_block,
+        "costs": cfg_resolved.get("costs", {}),
         "resolved_costs": {
             "commission": float(costs.get("commission", 0.0)),
             "spread_price": float(costs.get("spread_price", 0.0)),
@@ -257,7 +291,7 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
             "equity": str(equity_path),
             "metrics": str(metrics_path),
         },
-        "cfg_hash_sha256": hashlib.sha256(_canonical_cfg_json(cfg).encode("utf-8")).hexdigest(),
+        "cfg_hash_sha256": hashlib.sha256(_canonical_cfg_json(cfg_resolved).encode("utf-8")).hexdigest(),
     }
     (run_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
@@ -274,11 +308,6 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
 
 
 def _load_yaml_cfg(path: str) -> Dict[str, Any]:
-    try:
-        import yaml  # type: ignore
-    except Exception as e:
-        raise RuntimeError("Missing dependency 'pyyaml'. Install it with: pip install pyyaml") from e
-
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Config file not found: {path}")

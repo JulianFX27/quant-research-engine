@@ -6,7 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import yaml
@@ -17,6 +17,7 @@ from backtester.orchestrator.run import run_from_config
 @dataclass(frozen=True)
 class BatchItem:
     config_path: str
+    policy_id: Optional[str] = None
 
 
 LEADERBOARD_COLUMNS: List[str] = [
@@ -26,11 +27,19 @@ LEADERBOARD_COLUMNS: List[str] = [
     # Identity
     "status",
     "config_path",
+    "policy_id",
     "run_id",
     "name",
     "symbol",
     "timeframe",
     "strategy_name",
+    # Execution policy / effective execution
+    "execution_policy_id",
+    "execution_fill_mode",
+    "execution_intrabar_path",
+    "execution_intrabar_tie",
+    "costs_spread_pips_effective",
+    "costs_slippage_pips_effective",
     # Dataset identity (traceability)
     "dataset_id",
     "dataset_fp8",
@@ -83,12 +92,24 @@ LEADERBOARD_COLUMNS: List[str] = [
 ]
 
 
-def _run_one(config_path: str, out_root: str) -> Dict[str, Any]:
-    cfg = yaml.safe_load(Path(config_path).read_text())
+def _apply_policy_to_cfg(cfg: Dict[str, Any], policy_id: Optional[str]) -> Dict[str, Any]:
+    if not policy_id:
+        return cfg
+    cfg2 = dict(cfg)
+    exe = dict((cfg2.get("execution", {}) or {}))
+    exe["policy_id"] = str(policy_id).strip()
+    cfg2["execution"] = exe
+    return cfg2
+
+
+def _run_one(item: BatchItem, out_root: str) -> Dict[str, Any]:
+    cfg = yaml.safe_load(Path(item.config_path).read_text())
+    cfg = _apply_policy_to_cfg(cfg, item.policy_id)
     res = run_from_config(cfg, out_dir=out_root)
     return {
         "status": "ok",
-        "config_path": config_path,
+        "config_path": item.config_path,
+        "policy_id": item.policy_id,
         "run_id": res.get("run_id"),
         "outputs": res.get("outputs", {}),
         "metrics": res.get("metrics", {}),
@@ -157,11 +178,19 @@ def _row_from_result(r: Dict[str, Any], batch_id: str, dataset_compat: str) -> D
         # Identity
         "status": _normalize_status(r.get("status", "ok")),
         "config_path": r.get("config_path"),
+        "policy_id": r.get("policy_id"),
         "run_id": r.get("run_id"),
         "name": r.get("name"),
         "symbol": r.get("symbol"),
         "timeframe": r.get("timeframe"),
         "strategy_name": r.get("strategy_name"),
+        # Execution policy (effective)
+        "execution_policy_id": m.get("execution_policy_id"),
+        "execution_fill_mode": m.get("execution_fill_mode"),
+        "execution_intrabar_path": m.get("execution_intrabar_path"),
+        "execution_intrabar_tie": m.get("execution_intrabar_tie"),
+        "costs_spread_pips_effective": m.get("costs_spread_pips_effective"),
+        "costs_slippage_pips_effective": m.get("costs_slippage_pips_effective"),
         # Dataset (traceability)
         "dataset_id": m.get("dataset_id"),
         "dataset_fp8": m.get("dataset_fp8"),
@@ -219,12 +248,28 @@ def _row_from_result(r: Dict[str, Any], batch_id: str, dataset_compat: str) -> D
     return row
 
 
+def _parse_policy_list(s: Optional[str]) -> List[str]:
+    if not s:
+        return []
+    parts = [p.strip() for p in str(s).split(",")]
+    return [p for p in parts if p]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--configs_dir", required=True, help="Directory containing run YAML configs")
     ap.add_argument("--out", default="results/runs", help="Output root directory for runs")
     ap.add_argument("--jobs", type=int, default=4, help="Number of parallel workers")
     ap.add_argument("--pattern", default="*.yaml", help="Glob pattern for config files (default: *.yaml)")
+
+    # Execution policy controls
+    ap.add_argument("--policy", default=None, help="Force a single execution.policy_id for all configs")
+    ap.add_argument(
+        "--policy-sweep",
+        default=None,
+        help="Comma-separated list of policy_ids to run per config (expands runs). Example: baseline,stress_spread_2",
+    )
+
     args = ap.parse_args()
 
     configs_dir = Path(args.configs_dir)
@@ -244,22 +289,32 @@ def main() -> None:
     leaderboard_path = leaderboard_dir / f"leaderboard_{batch_id}.csv"
     manifest_path = leaderboard_dir / f"batch_manifest_{batch_id}.json"
 
+    # Build batch items (config x policy)
+    sweep = _parse_policy_list(args.policy_sweep)
+    force_policy = str(args.policy).strip() if args.policy else None
+
+    items: List[BatchItem] = []
+    if sweep:
+        for cp in config_paths:
+            for pid in sweep:
+                items.append(BatchItem(config_path=cp, policy_id=pid))
+    else:
+        for cp in config_paths:
+            items.append(BatchItem(config_path=cp, policy_id=force_policy))
+
     results: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
 
     with ProcessPoolExecutor(max_workers=args.jobs) as ex:
-        futs = {ex.submit(_run_one, cp, out_root): cp for cp in config_paths}
+        futs = {ex.submit(_run_one, it, out_root): it for it in items}
         for fut in as_completed(futs):
-            cp = futs[fut]
+            it = futs[fut]
             try:
                 results.append(fut.result())
             except Exception as e:
-                errors.append({"config_path": cp, "error": repr(e)})
+                errors.append({"config_path": it.config_path, "policy_id": it.policy_id, "error": repr(e)})
 
     # Compute dataset compatibility based on successful runs first
-    # (errors don't contribute dataset fingerprints)
-    # We'll compute once and stamp into all rows.
-    # Build provisional rows with minimal dataset_fp8 to evaluate compat.
     provisional_rows: List[Dict[str, Any]] = []
     for r in results:
         m = r.get("metrics", {}) or {}
@@ -274,6 +329,7 @@ def main() -> None:
                 {
                     "status": "error",
                     "config_path": er.get("config_path"),
+                    "policy_id": er.get("policy_id"),
                     "run_id": None,
                     "outputs": {},
                     "metrics": {},
@@ -287,9 +343,7 @@ def main() -> None:
             )
         )
 
-    # Drop any header-like row that could have slipped in
     rows = [r for r in rows if not _is_header_like_row(r)]
-
     df = pd.DataFrame(rows).reindex(columns=LEADERBOARD_COLUMNS)
 
     df = df.sort_values(
@@ -310,6 +364,9 @@ def main() -> None:
         "leaderboard_csv": str(leaderboard_path),
         "dataset_compat": dataset_compat,
         "n_configs": len(config_paths),
+        "n_items": len(items),
+        "policy": force_policy,
+        "policy_sweep": sweep,
         "n_success": len(results),
         "n_errors": len(errors),
         "errors": errors,

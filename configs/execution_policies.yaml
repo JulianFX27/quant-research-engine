@@ -1,0 +1,27 @@
+# configs/execution_policies.yaml
+policies:
+  baseline:
+    execution: {}
+    costs: {}
+    risk: {}
+
+  stress_spread_2:
+    costs:
+      spread_pips: 2.0
+
+  stress_slip_0_5:
+    costs:
+      slippage_pips: 0.5
+
+  stress_spread_2_slip_0_5:
+    costs:
+      spread_pips: 2.0
+      slippage_pips: 0.5
+
+  intrabar_olhc:
+    execution:
+      intrabar_path: OLHC
+
+  tie_tp_first:
+    execution:
+      intrabar_tie: tp_first

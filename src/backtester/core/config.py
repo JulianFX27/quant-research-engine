@@ -163,6 +163,12 @@ def validate_run_config(cfg: dict) -> None:
     # ---- Execution ----
     exe = cfg["execution"]
 
+    # execution.policy_id (optional, used by C2 resolver; here only basic type check)
+    if "policy_id" in exe:
+        pid = exe.get("policy_id")
+        if not isinstance(pid, str) or not pid.strip():
+            raise ValueError("Invalid execution.policy_id: must be a non-empty string if provided")
+
     fill_mode = exe.get("fill_mode", "close")
     if fill_mode not in ("close", "next_open"):
         raise ValueError("Invalid execution.fill_mode: must be one of ['close', 'next_open']")
