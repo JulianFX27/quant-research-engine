@@ -66,6 +66,15 @@ def _make_run_id(cfg: Dict[str, Any]) -> str:
     return f"{ts}_{h}"
 
 
+def _get_dataset_registry_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    return cfg.get("dataset_registry", {}) or {}
+
+
+def _get_registry_dir(cfg: Dict[str, Any]) -> str:
+    dsreg = _get_dataset_registry_cfg(cfg)
+    return str(dsreg.get("registry_dir") or "data/registry")
+
+
 def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, Any, str]:
     """
     Returns:
@@ -80,6 +89,14 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
     symbol = str(cfg.get("symbol") or "UNKNOWN")
     timeframe = str(cfg.get("timeframe") or "UNKNOWN")
     source = str(instrument.get("data_source") or instrument.get("source") or "csv")
+
+    dsreg = _get_dataset_registry_cfg(cfg)
+    allow_override = bool(dsreg.get("allow_override", False))
+    override_reason = str(dsreg.get("override_reason", "") or "")
+    append_match_event = bool(dsreg.get("append_match_event", False))
+    registry_dir = _get_registry_dir(cfg)
+
+    Path(registry_dir).mkdir(parents=True, exist_ok=True)
 
     dataset_id_prov = build_dataset_id(
         instrument=symbol,
@@ -105,23 +122,113 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
 
     dataset_meta_final = replace(dataset_meta, dataset_id=dataset_id_final)
 
-    # Dataset registry policy (YAML-controlled)
-    dsreg = cfg.get("dataset_registry", {}) or {}
-    allow_override = bool(dsreg.get("allow_override", False))
-    override_reason = str(dsreg.get("override_reason", "") or "")
-
     register_or_validate_dataset(
         dataset_meta_final,
-        registry_dir="data/registry",
+        registry_dir=registry_dir,
         allow_new_fingerprint=allow_override,
         override_reason=override_reason,
+        append_match_event=append_match_event,
     )
 
     return df, dataset_meta_final, dataset_id_final
 
 
+def _flatten_entry_gate_into_metrics(metrics: Dict[str, Any], risk_report: Dict[str, Any]) -> None:
+    """
+    Flatten entry-gate counters into 'metrics' so leaderboard can compare gating regimes.
+
+    Writes:
+      - entry_gate_* (v1)
+      - entry_gate_v2_* (guardrails v2)
+      - per-reason wide columns: entry_gate_blocked_by_reason__<REASON>
+      - per-reason wide columns: entry_gate_v2_blocked_by_reason__<REASON>
+    """
+    rr = risk_report or {}
+
+    eg1 = (rr.get("entry_gate") or {})
+    metrics["entry_gate_attempted_entries"] = int(eg1.get("attempted_entries", 0) or 0)
+    metrics["entry_gate_blocked_total"] = int(eg1.get("blocked_total", 0) or 0)
+    metrics["entry_gate_blocked_unique_bars"] = int(eg1.get("blocked_unique_bars", 0) or 0)
+
+    bbr1 = eg1.get("blocked_by_reason") or {}
+    if isinstance(bbr1, dict):
+        for k, v in bbr1.items():
+            metrics[f"entry_gate_blocked_by_reason__{k}"] = int(v or 0)
+
+    gr = (rr.get("guardrails") or {})
+    eg2 = (gr.get("entry_gate") or {})
+    metrics["entry_gate_v2_attempted_entries"] = int(eg2.get("attempted_entries", 0) or 0)
+    metrics["entry_gate_v2_blocked_total"] = int(eg2.get("blocked_total", 0) or 0)
+    metrics["entry_gate_v2_blocked_unique_bars"] = int(eg2.get("blocked_unique_bars", 0) or 0)
+
+    bbr2 = eg2.get("blocked_v2_by_reason") or {}
+    if isinstance(bbr2, dict):
+        for k, v in bbr2.items():
+            metrics[f"entry_gate_v2_blocked_by_reason__{k}"] = int(v or 0)
+
+
+def _flatten_fill_dropped_into_metrics(metrics: Dict[str, Any], risk_report: Dict[str, Any]) -> None:
+    """
+    Flatten 'entry_fill_dropped' diagnostics (not gated, but unfillable).
+
+    Writes:
+      - entry_fill_dropped_total
+      - entry_fill_dropped_by_reason__<REASON>
+    """
+    rr = risk_report or {}
+    d = (rr.get("entry_fill_dropped") or {})
+    metrics["entry_fill_dropped_total"] = int(d.get("dropped_total", 0) or 0)
+
+    by_reason = d.get("dropped_by_reason") or {}
+    if isinstance(by_reason, dict):
+        for k, v in by_reason.items():
+            metrics[f"entry_fill_dropped_by_reason__{k}"] = int(v or 0)
+
+
+def _flatten_engine_util_into_metrics(metrics: Dict[str, Any], risk_report: Dict[str, Any]) -> None:
+    """
+    Flatten engine utilization metrics.
+
+    Writes:
+      - engine_bars_total
+      - engine_time_in_position_bars
+      - engine_time_in_position_rate
+    """
+    rr = risk_report or {}
+    e = (rr.get("engine") or {})
+    metrics["engine_bars_total"] = int(e.get("bars_total", 0) or 0)
+    metrics["engine_time_in_position_bars"] = int(e.get("time_in_position_bars", 0) or 0)
+
+    tir = e.get("time_in_position_rate")
+    try:
+        metrics["engine_time_in_position_rate"] = float(tir) if tir is not None else None
+    except Exception:
+        metrics["engine_time_in_position_rate"] = None
+
+
+def _flatten_forced_exits_into_metrics(metrics: Dict[str, Any], risk_report: Dict[str, Any]) -> None:
+    """
+    Flatten forced exits audit.
+
+    Writes:
+      - forced_exits_total
+      - forced_exits__<REASON>
+    """
+    rr = risk_report or {}
+    fx = (rr.get("forced_exits") or {})
+    if isinstance(fx, dict):
+        total = 0
+        for k, v in fx.items():
+            n = int(v or 0)
+            total += n
+            metrics[f"forced_exits__{k}"] = n
+        metrics["forced_exits_total"] = int(total)
+    else:
+        metrics["forced_exits_total"] = 0
+
+
 def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
-    # Apply execution policy (Option B) BEFORE validation
+    # Apply execution policy BEFORE validation
     pol_res = apply_execution_policy(cfg)
     cfg_resolved = pol_res.cfg_resolved if pol_res is not None else cfg
 
@@ -135,7 +242,6 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=False)
 
     started_at_utc = datetime.now(timezone.utc).isoformat()
-
     instrument = cfg_resolved.get("instrument", {}) or {}
 
     # Load + dataset registry (global)
@@ -157,9 +263,16 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     costs_cfg = dict(cfg_resolved.get("costs", {}))
     pip_size = float(instrument.get("pip_size", 0.0) or 0.0)
 
-    # Keep "effective" costs in pips for leaderboard traceability
+    # Keep "effective" costs in pips for leaderboard traceability (cast to float if present)
     spread_pips_eff = costs_cfg.get("spread_pips")
     slippage_pips_eff = costs_cfg.get("slippage_pips")
+    try:
+        if spread_pips_eff is not None:
+            spread_pips_eff = float(spread_pips_eff)
+        if slippage_pips_eff is not None:
+            slippage_pips_eff = float(slippage_pips_eff)
+    except Exception:
+        pass
 
     costs = dict(costs_cfg)
     if pip_size > 0:
@@ -188,7 +301,9 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_raw["execution_policy_id"] = (exe.get("policy_id") if isinstance(exe, dict) else None)
     metrics_raw["execution_fill_mode"] = (exe.get("fill_mode") if isinstance(exe, dict) else None)
     metrics_raw["execution_intrabar_path"] = (
-        str(exe.get("intrabar_path")).replace(" ", "").upper() if isinstance(exe, dict) and exe.get("intrabar_path") else None
+        str(exe.get("intrabar_path")).replace(" ", "").upper()
+        if isinstance(exe, dict) and exe.get("intrabar_path")
+        else None
     )
     metrics_raw["execution_intrabar_tie"] = (exe.get("intrabar_tie") if isinstance(exe, dict) else None)
     metrics_raw["costs_spread_pips_effective"] = spread_pips_eff
@@ -233,6 +348,18 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_raw["gr_blocked_by_max_concurrent_positions"] = gr_blocked.get("by_max_concurrent_positions")
     metrics_raw["gr_blocked_by_time_window"] = gr_blocked.get("by_time_window")
     metrics_raw["gr_forced_exit_by_max_holding_bars"] = gr_forced.get("by_max_holding_bars")
+
+    # Entry gate (v1 + v2) into metrics
+    _flatten_entry_gate_into_metrics(metrics_raw, risk_report)
+
+    # NEW: dropped (unfillable) entries
+    _flatten_fill_dropped_into_metrics(metrics_raw, risk_report)
+
+    # NEW: engine utilization
+    _flatten_engine_util_into_metrics(metrics_raw, risk_report)
+
+    # NEW: forced exits (EOF / max_hold, etc.)
+    _flatten_forced_exits_into_metrics(metrics_raw, risk_report)
 
     metrics = _sanitize_for_json(metrics_raw)
 
@@ -281,8 +408,11 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
             "commission": float(costs.get("commission", 0.0)),
             "spread_price": float(costs.get("spread_price", 0.0)),
             "slippage_price": float(costs.get("slippage_price", 0.0)),
+            "spread_pips_effective": spread_pips_eff,
+            "slippage_pips_effective": slippage_pips_eff,
         },
-        "risk": risk_cfg,
+        # IMPORTANT: persist RESOLVED risk for auditability
+        "risk": risk_cfg_resolved,
         "risk_report": risk_report,
         "dataset": dataset_dict,
         "outputs": {

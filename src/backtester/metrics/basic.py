@@ -1,7 +1,8 @@
+# src/backtester/metrics/basic.py
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -17,7 +18,7 @@ def _to_float_or_none(x: Any) -> float | None:
         return None
     if not np.isfinite(v):
         return None
-    return v
+    return float(v)
 
 
 def _calc_max_consecutive_losses(values: np.ndarray) -> int:
@@ -35,15 +36,20 @@ def _calc_max_consecutive_losses(values: np.ndarray) -> int:
     return int(max_streak)
 
 
-def _calc_drawdown(equity: np.ndarray) -> tuple[float, float]:
+def _calc_drawdown(equity: np.ndarray) -> Tuple[float, float]:
+    """
+    Returns (max_dd_abs, max_dd_pct) where pct is relative to peak.
+    If peak <= 0, pct is computed only when peak > 0.
+    """
     if equity.size == 0:
         return 0.0, 0.0
 
-    peak = equity[0]
+    peak = float(equity[0])
     max_dd_abs = 0.0
     max_dd_pct = 0.0
 
     for x in equity:
+        x = float(x)
         if x > peak:
             peak = x
         dd = peak - x
@@ -58,9 +64,19 @@ def _calc_drawdown(equity: np.ndarray) -> tuple[float, float]:
 
 
 def summarize_trades(trades: List[Trade]) -> Dict[str, Any]:
+    """
+    Research-grade summary.
+    - PnL-space metrics
+    - Hold-time metrics
+    - Exit reason counts + forced/EOF aggregates
+    - R-space metrics (requires risk_price and qty; fallback to abs(entry-sl) if needed)
+    """
     if not trades:
         return {"n_trades": 0}
 
+    # -------------------------
+    # PnL-space core stats
+    # -------------------------
     pnls = np.array([_to_float_or_none(getattr(t, "pnl", None)) or 0.0 for t in trades], dtype=float)
     wins = pnls[pnls > 0]
     losses = pnls[pnls <= 0]
@@ -81,7 +97,9 @@ def summarize_trades(trades: List[Trade]) -> Dict[str, Any]:
     out["max_drawdown_pct"] = max_dd_pct
     out["max_consecutive_losses"] = _calc_max_consecutive_losses(pnls)
 
+    # -------------------------
     # Hold time
+    # -------------------------
     hold_mins: list[float] = []
     for t in trades:
         et = getattr(t, "entry_time", None)
@@ -107,11 +125,49 @@ def summarize_trades(trades: List[Trade]) -> Dict[str, Any]:
         out["min_hold_minutes"] = None
         out["max_hold_minutes"] = None
 
-    # R-multiples (primary: risk_price field; fallback: abs(entry - sl))
+    # -------------------------
+    # Exit reason counts + aggregates
+    # -------------------------
+    reason_counts: Dict[str, int] = {}
+    for t in trades:
+        r = str(getattr(t, "exit_reason", "") or "UNKNOWN").strip()
+        reason_counts[r] = int(reason_counts.get(r, 0)) + 1
+
+    for r, n in sorted(reason_counts.items()):
+        out[f"exit_reason_count__{r}"] = int(n)
+
+    forced_exits_total = 0
+    forced_eof_total = 0
+    eof_exits_total = 0
+
+    for rk, n in reason_counts.items():
+        rk = str(rk)
+        n = int(n)
+        if rk.startswith("FORCE_"):
+            forced_exits_total += n
+            if rk == "FORCE_EOF":
+                forced_eof_total += n
+                eof_exits_total += n  # count EOF even if expressed as FORCE_EOF
+        if rk == "EOF":
+            eof_exits_total += n
+
+    out["forced_exits_total"] = int(forced_exits_total)
+    out["forced_eof_total"] = int(forced_eof_total)
+    out["eof_exits_total"] = int(eof_exits_total)
+    out["non_forced_exits_total"] = int(len(trades) - forced_exits_total)
+
+    # -------------------------
+    # R-space metrics (correct contract uses qty)
+    #   R = pnl / (risk_price * abs(qty))
+    # -------------------------
     r_mults: list[float] = []
     for t in trades:
         pnl = _to_float_or_none(getattr(t, "pnl", None))
         if pnl is None:
+            continue
+
+        qty = _to_float_or_none(getattr(t, "qty", None))
+        if qty is None or abs(qty) <= 0:
             continue
 
         rp = _to_float_or_none(getattr(t, "risk_price", None))
@@ -124,7 +180,11 @@ def summarize_trades(trades: List[Trade]) -> Dict[str, Any]:
         if rp is None or rp <= 0:
             continue
 
-        r_mults.append(float(pnl / rp))
+        denom = float(rp) * abs(float(qty))
+        if denom <= 0:
+            continue
+
+        r_mults.append(float(pnl / denom))
 
     if r_mults:
         R = np.array(r_mults, dtype=float)
