@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 import pandas as pd
 
@@ -32,35 +32,20 @@ class Trade:
 class SimpleBarEngine:
     """Minimal bar-by-bar engine (v1 hardened intrabar) + guardrails.
 
-    Features:
-      - One position at a time
-      - Entry fill_mode:
-          - "close": fill at close of signal bar
-          - "next_open": fill at open of next bar
-      - Exit intrabar:
-          - If TP and SL both reachable in bar, decide via intrabar_path:
-              - "OHLC": open->high->low->close
-              - "OLHC": open->low->high->close
-          - Fallback tie-break via intrabar_tie
-      - Costs:
-          - commission (abs per-unit per trade)
-          - spread_price (full spread in price units)
-          - slippage_price (adverse per fill)
+    Key semantics:
+      - Single position only
+      - fill_mode: close | next_open
+      - intrabar_path: OHLC | OLHC
+      - intrabar_tie: sl_first | tp_first
 
-    Guardrails (risk_cfg):
-      - max_daily_loss_R: float | None
-      - max_trades_per_day: int | None
-      - cooldown_bars: int
+    ARCH A/B:
+      - force_exit_on_eof:
+          True  => close at EOF (FORCE_EOF trade)
+          False => do NOT close; report open_position_at_eof (A_PURE_SLTP)
 
-    Guardrails v2 (via backtester.risk.guardrails.Guardrails):
-      - max_concurrent_positions (engine supports only 1 today; >1 is refused)
-      - time_window_enabled + window_start_utc/window_end_utc (UTC)
-      - max_holding_bars (force exit at close)
-
-    Research-grade additions:
-      - FORCE_EOF: close open position at end of dataset
-      - dropped entry audits (pending intent at EOF / no next open)
-      - time-in-position metrics
+    max_holding_bars semantics:
+      - 0 / None => DISABLED
+      - >0       => ENABLED (force exit at close when holding_bars >= max_holding_bars)
     """
 
     def __init__(self, *, costs: Dict[str, Any], exec_cfg: Dict[str, Any], risk_cfg: Optional[Dict[str, Any]] = None):
@@ -72,23 +57,37 @@ class SimpleBarEngine:
         raw_path = str(exec_cfg.get("intrabar_path", "OHLC")).replace(" ", "").upper()
         self.intrabar_path = raw_path if raw_path in ("OHLC", "OLHC") else "OHLC"
 
-        # Risk / guardrails config
-        risk_cfg = risk_cfg or {}
+        # ---- Normalize risk_cfg (single source of truth) ----
+        risk_cfg_in = risk_cfg or {}
+        risk_cfg_norm: Dict[str, Any] = dict(risk_cfg_in)
+
+        # ARCH A/B control (default True for research)
+        self.force_exit_on_eof: bool = bool(risk_cfg_norm.get("force_exit_on_eof", True))
+        risk_cfg_norm["force_exit_on_eof"] = self.force_exit_on_eof
+
+        # max_holding_bars normalization: 0/None => disabled
+        _mhb = risk_cfg_norm.get("max_holding_bars", None)
+        try:
+            _mhb_int = int(_mhb) if _mhb is not None else 0
+        except Exception:
+            _mhb_int = 0
+        self.max_holding_bars: Optional[int] = _mhb_int if (_mhb_int > 0) else None
+        risk_cfg_norm["max_holding_bars"] = int(self.max_holding_bars) if self.max_holding_bars is not None else 0
+
+        # v1 daily risk gates
         self.max_daily_loss_R: Optional[float] = (
-            float(risk_cfg["max_daily_loss_R"]) if risk_cfg.get("max_daily_loss_R") is not None else None
+            float(risk_cfg_norm["max_daily_loss_R"]) if risk_cfg_norm.get("max_daily_loss_R") is not None else None
         )
         self.max_trades_per_day: Optional[int] = (
-            int(risk_cfg["max_trades_per_day"]) if risk_cfg.get("max_trades_per_day") is not None else None
+            int(risk_cfg_norm["max_trades_per_day"]) if risk_cfg_norm.get("max_trades_per_day") is not None else None
         )
-        self.cooldown_bars: int = int(risk_cfg.get("cooldown_bars", 0) or 0)
+        self.cooldown_bars: int = int(risk_cfg_norm.get("cooldown_bars", 0) or 0)
         if self.cooldown_bars < 0:
             self.cooldown_bars = 0
-
-        # Guardrails v2
-        self.guardrails = Guardrails(risk_cfg)
+        risk_cfg_norm["cooldown_bars"] = self.cooldown_bars
 
         # Engine is single-position today. Refuse configs that claim otherwise.
-        mcp = int((risk_cfg or {}).get("max_concurrent_positions", 1) or 1)
+        mcp = int(risk_cfg_norm.get("max_concurrent_positions", 1) or 1)
         if mcp != 1:
             raise ValueError(
                 "ENGINE_SINGLE_POSITION_ONLY: max_concurrent_positions must be 1 for SimpleBarEngine.\n"
@@ -96,7 +95,13 @@ class SimpleBarEngine:
                 "Fix: set risk.max_concurrent_positions: 1 (or implement multi-position engine).\n"
             )
 
-        # Exposed after run() for persistence/audit (orchestrator can copy into metrics/manifest)
+        # Guardrails v2 (use normalized cfg to avoid semantic drift)
+        self.guardrails = Guardrails(risk_cfg_norm)
+
+        # Persist normalized cfg for reporting
+        self._risk_cfg_norm = risk_cfg_norm
+
+        # Exposed after run() for persistence/audit
         self.last_risk_report: Dict[str, Any] = {}
 
     def _apply_costs(self, pnl: float, qty: float) -> float:
@@ -220,42 +225,34 @@ class SimpleBarEngine:
         pending_intent: Optional[OrderIntent] = None
         pending_tag: str = ""
 
-        # Guardrails state (UTC-day scoped)
         current_day: Optional[str] = None
         entries_today: int = 0
         realized_R_today: float = 0.0
         stopped_today: bool = False
 
-        # Cooldown state (bar-index scoped)
         cooldown_until_index: int = 0
 
-        # Legacy counters (keep for backward compatibility with your orchestrator extraction)
         n_blocked_by_daily_stop: int = 0
         n_blocked_by_max_trades: int = 0
         n_blocked_by_cooldown: int = 0
 
-        # RiskReport v1 counters
         attempted_entries: int = 0
         blocked_total: int = 0
         blocked_by_reason: Dict[str, int] = {}
         blocked_unique_bars: Set[int] = set()
 
-        # Guardrails v2 counters (entry gating reasons)
         blocked_v2_by_reason: Dict[str, int] = {}
-
-        # Forced exits counters
         forced_exits: Dict[str, int] = {}
 
-        # Research-grade: dropped entries (not blocked by gates, but could not be filled)
         dropped_entries_total: int = 0
         dropped_entries_by_reason: Dict[str, int] = {}
 
-        # Research-grade: time in position
         time_in_position_bars: int = 0
 
-        # For EOF close metadata
         last_bar_ts: Optional[pd.Timestamp] = None
         last_bar_close: Optional[float] = None
+
+        open_position_at_eof: bool = False  # ARCH A audit
 
         for i, (ts, row) in enumerate(df.iterrows()):
             last_bar_ts = ts
@@ -263,7 +260,6 @@ class SimpleBarEngine:
 
             day_key = self._utc_day_key(ts)
 
-            # Day rollover resets daily guardrails
             if current_day is None:
                 current_day = day_key
             elif day_key != current_day:
@@ -286,18 +282,14 @@ class SimpleBarEngine:
                 tp = float(pending_intent.tp_price) if pending_intent.tp_price is not None else None
                 pos_sl_price = sl
                 pos_tp_price = tp
-
-                # Formal risk contract: abs(filled_entry_price - sl_level_price)
                 pos_risk_price = abs(float(entry_price) - float(sl)) if (sl is not None) else None
 
                 tag = pending_tag
                 pending_intent = None
                 pending_tag = ""
 
-                # Count entry (for max trades/day)
                 entries_today += 1
 
-            # Track time in position
             if pos_side is not None:
                 time_in_position_bars += 1
 
@@ -321,7 +313,7 @@ class SimpleBarEngine:
                         if l <= float(tp) <= h:
                             exit_reason, exit_level = "TP", float(tp)
 
-                # Tie-break fallback
+                # Tie-break fallback (defensive)
                 if exit_reason is None and sl is not None and tp is not None:
                     hit_sl = l <= float(sl) <= h
                     hit_tp = l <= float(tp) <= h
@@ -331,8 +323,8 @@ class SimpleBarEngine:
                         else:
                             exit_reason, exit_level = "SL", float(sl)
 
-                # Force-exit by max holding bars (close)
-                if exit_reason is None:
+                # FORCE_MAX_HOLD only if enabled (>0)
+                if exit_reason is None and (self.max_holding_bars is not None):
                     holding_bars = i - int(entry_index)
                     force, force_reason = self.guardrails.should_force_exit(holding_bars=holding_bars)
                     if force:
@@ -359,16 +351,13 @@ class SimpleBarEngine:
                     )
                     trades.append(trade)
 
-                    # Update realized R today (daily stop uses realized R of exits)
                     r_mult = self._safe_r_multiple(trade.pnl, trade.risk_price, trade.qty)
                     if r_mult is not None:
                         realized_R_today += float(r_mult)
 
-                    # Apply daily stop if configured
                     if (self.max_daily_loss_R is not None) and (realized_R_today <= -abs(float(self.max_daily_loss_R))):
                         stopped_today = True
 
-                    # Start cooldown window after exit
                     if self.cooldown_bars > 0:
                         cooldown_until_index = max(cooldown_until_index, i + self.cooldown_bars + 1)
 
@@ -385,7 +374,7 @@ class SimpleBarEngine:
                     pos_tp_price = None
                     pos_risk_price = None
 
-            # Schedule / fill entries (only if flat and no pending)
+            # Schedule entries (only if flat and no pending)
             if pos_side is None and pending_intent is None:
                 intents = intents_by_bar[i] if i < len(intents_by_bar) else []
                 if intents:
@@ -395,27 +384,23 @@ class SimpleBarEngine:
                     blocked = False
                     blocked_reason: Optional[str] = None
 
-                    # Daily stop gate
                     if stopped_today:
                         n_blocked_by_daily_stop += 1
                         blocked = True
                         blocked_reason = "DAILY_STOP"
 
-                    # Max trades/day gate
                     if (not blocked) and (self.max_trades_per_day is not None) and (entries_today >= int(self.max_trades_per_day)):
                         n_blocked_by_max_trades += 1
                         blocked = True
                         blocked_reason = "MAX_TRADES_PER_DAY"
 
-                    # Cooldown gate
                     if (not blocked) and (i < cooldown_until_index):
                         n_blocked_by_cooldown += 1
                         blocked = True
                         blocked_reason = "COOLDOWN"
 
-                    # Guardrails v2 gate (UTC window + max concurrent positions)
                     if not blocked:
-                        active_positions = 0  # engine is flat here by construction
+                        active_positions = 0  # flat by construction
                         if self.fill_mode == "next_open":
                             if i < len(df) - 1:
                                 entry_ts = df.index[i + 1]
@@ -428,7 +413,6 @@ class SimpleBarEngine:
                                     blocked_reason = f"V2_{str(reason) if reason else 'GUARDRAILS'}"
                                     self._bump(blocked_v2_by_reason, str(reason) if reason else "UNKNOWN")
                             else:
-                                # Cannot schedule next_open on last bar => treat as dropped (not a "risk gate")
                                 dropped_entries_total += 1
                                 self._bump(dropped_entries_by_reason, "NO_NEXT_OPEN")
                                 continue
@@ -445,19 +429,15 @@ class SimpleBarEngine:
                     if blocked:
                         blocked_total += 1
                         blocked_unique_bars.add(i)
-                        if blocked_reason:
-                            self._bump(blocked_by_reason, blocked_reason)
-                        else:
-                            self._bump(blocked_by_reason, "UNKNOWN")
+                        self._bump(blocked_by_reason, blocked_reason or "UNKNOWN")
                         continue
 
-                    # ---- Proceed with entry scheduling/fill ----
+                    # Proceed with entry
                     if self.fill_mode == "next_open":
                         if i < len(df) - 1:
                             pending_intent = intent
                             pending_tag = intent.tag
                         else:
-                            # Same as above: last bar cannot fill next open => dropped
                             dropped_entries_total += 1
                             self._bump(dropped_entries_by_reason, "NO_NEXT_OPEN")
                     else:
@@ -476,44 +456,46 @@ class SimpleBarEngine:
                         tag = intent.tag
                         entries_today += 1
 
-        # If we end with a pending intent, it was never filled
+        # EOF: pending intent never filled
         if pending_intent is not None:
             dropped_entries_total += 1
             self._bump(dropped_entries_by_reason, "PENDING_INTENT_AT_EOF")
 
-        # If we end with an open position, force-close at last close (research-grade default)
-        if pos_side is not None and entry_time is not None and (last_bar_ts is not None) and (last_bar_close is not None):
-            trade = self._close_position(
-                ts=last_bar_ts,
-                exit_level=float(last_bar_close),
-                exit_reason="FORCE_EOF",
-                pos_side=pos_side,
-                pos_qty=pos_qty,
-                entry_price=float(entry_price),
-                entry_time=entry_time,
-                tag=tag,
-                sl_price=pos_sl_price,
-                tp_price=pos_tp_price,
-                risk_price=pos_risk_price,
-            )
-            trades.append(trade)
-            self._bump(forced_exits, "EOF")
+        # EOF: open position handling (ARCH A/B)
+        if (pos_side is not None) and (entry_time is not None) and (last_bar_ts is not None) and (last_bar_close is not None):
+            if self.force_exit_on_eof:
+                trade = self._close_position(
+                    ts=last_bar_ts,
+                    exit_level=float(last_bar_close),
+                    exit_reason="FORCE_EOF",
+                    pos_side=pos_side,
+                    pos_qty=pos_qty,
+                    entry_price=float(entry_price),
+                    entry_time=entry_time,
+                    tag=tag,
+                    sl_price=pos_sl_price,
+                    tp_price=pos_tp_price,
+                    risk_price=pos_risk_price,
+                )
+                trades.append(trade)
+                self._bump(forced_exits, "EOF")
 
-            # Update realized R today too (if applicable)
-            r_mult = self._safe_r_multiple(trade.pnl, trade.risk_price, trade.qty)
-            if r_mult is not None:
-                realized_R_today += float(r_mult)
+                r_mult = self._safe_r_multiple(trade.pnl, trade.risk_price, trade.qty)
+                if r_mult is not None:
+                    realized_R_today += float(r_mult)
+            else:
+                open_position_at_eof = True
+                self._bump(forced_exits, "EOF_SKIPPED_BY_POLICY")
 
-            # Reset position to keep internal consistency
+            # Reset internal state (keep object consistent)
             pos_side = None
             pending_intent = None
 
-        # Guardrails report from component (existing contract)
+        # Guardrails report from component
         gr_rep = self.guardrails.report()
         if not isinstance(gr_rep, dict):
             gr_rep = {"raw": gr_rep}
 
-        # Augment guardrails report (non-breaking)
         gr_rep.setdefault("entry_gate", {})
         gr_rep["entry_gate"] = {
             "attempted_entries": attempted_entries,
@@ -532,20 +514,20 @@ class SimpleBarEngine:
                 "max_daily_loss_R": self.max_daily_loss_R,
                 "max_trades_per_day": self.max_trades_per_day,
                 "cooldown_bars": self.cooldown_bars,
+                "force_exit_on_eof": bool(self.force_exit_on_eof),
+                "max_holding_bars": int(self.max_holding_bars) if self.max_holding_bars is not None else 0,
             },
             "final_day_key_utc": current_day,
             "final_entries_today": entries_today,
             "final_realized_R_today": realized_R_today,
             "final_stopped_today": stopped_today,
 
-            # Backwards compatible (legacy fields your orchestrator already expects)
             "blocked": {
                 "by_daily_stop": n_blocked_by_daily_stop,
                 "by_max_trades_per_day": n_blocked_by_max_trades,
                 "by_cooldown": n_blocked_by_cooldown,
             },
 
-            # New v1 schema counters (research-grade)
             "entry_gate": {
                 "attempted_entries": attempted_entries,
                 "blocked_total": blocked_total,
@@ -553,23 +535,19 @@ class SimpleBarEngine:
                 "blocked_by_reason": dict(blocked_by_reason),
             },
 
-            # Guardrails v2 full report (plus entry_gate augment)
             "guardrails": gr_rep,
-
-            # Forced exits audit (engine-level)
             "forced_exits": dict(forced_exits),
 
-            # NEW: dropped entries (not gated, but not fillable)
             "entry_fill_dropped": {
                 "dropped_total": int(dropped_entries_total),
                 "dropped_by_reason": dict(dropped_entries_by_reason),
             },
 
-            # NEW: engine utilization metrics
             "engine": {
                 "bars_total": int(bars_total),
                 "time_in_position_bars": int(time_in_position_bars),
                 "time_in_position_rate": float(time_in_position_rate),
+                "open_position_at_eof": bool(open_position_at_eof),
             },
         }
 

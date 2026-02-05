@@ -1,0 +1,43 @@
+name: "baseline_v4_buy_vol_med"
+symbol: "EURUSD"
+timeframe: "M5"
+data_path: data/raw/eurusd_m5_tail_cut_before_exit.csv
+
+instrument:
+  pip_size: 0.0001
+  data_source: "csv_raw_external__cut_before_exit"
+dataset_registry:
+  registry_dir: "data/registry"
+  allow_override: false
+  override_reason: ""
+  append_match_event: false
+
+execution:
+  policy_id: "baseline"
+  fill_mode: "next_open"
+  intrabar_path: "OHLC"
+  intrabar_tie: "sl_first"
+
+costs:
+  commission: 0.0
+  spread_pips: 1.0
+  slippage_pips: 0.2
+
+risk:
+  max_daily_loss_R: 9999.0
+  max_trades_per_day: 1
+  cooldown_bars: 0
+  max_concurrent_positions: 1
+  force_exit_on_eof: true
+  max_holding_bars: 0
+strategy:
+  name: "BaselineV4VolBucketBuy"
+  params:
+    qty: 1.0
+    sl_pips: 11
+    tp_pips: 17
+    atr_n: 96
+    vol_bucket: "MED"
+    vol_q_low: 0.33
+    vol_q_high: 0.66
+    warmup_bars: 200

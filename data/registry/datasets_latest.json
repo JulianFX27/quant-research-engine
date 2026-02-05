@@ -1,4 +1,344 @@
 {
+  "EURUSD_M5_2022-01-03__2022-04-01__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2022-01-03__2022-04-01__csv_raw_external",
+    "end_ts": "2022-04-01T23:55:00+00:00",
+    "file_bytes": 1112609,
+    "file_sha256": "sha256:c485666b8edd93019f5342334387831244b88f32f924997470675a6205998272",
+    "fingerprint_sha256": "sha256:78ffcdb80562cfc7845babdd7dd955cd8e0790dcd2d1a4e0e463f5818488ef74",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:40.206009+00:00",
+    "rows": 18704,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2022-01-03__2022-04-02__csv_raw_external__fold001.csv",
+    "start_ts": "2022-01-03T01:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2022-01-03__2024-12-31__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2022-01-03__2024-12-31__csv_raw_external",
+    "end_ts": "2024-12-31T23:55:00+00:00",
+    "file_bytes": 13771852,
+    "file_sha256": "sha256:745de53b5765251ea81112cc0281d9e34baa7dc1f74128e2fb7f6a7c13ab9ea5",
+    "fingerprint_sha256": "sha256:b818c6a2f8ce51329741152ac492a0f2a3e4abd8d7dfe67b042c3f30693825bd",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T21:02:35.244243+00:00",
+    "rows": 223983,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/raw/eurusd_m5_2022-01-03__2024-12-31.csv",
+    "start_ts": "2022-01-03T01:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2022-04-04__2022-07-01__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2022-04-04__2022-07-01__csv_raw_external",
+    "end_ts": "2022-07-01T23:55:00+00:00",
+    "file_bytes": 1113823,
+    "file_sha256": "sha256:44d5bca0e0b6b7fd45766e93683430a1d7f044f7ec04d56b5cfe46da1b1fd459",
+    "fingerprint_sha256": "sha256:bde07d39f497faec5d31e0282dce4ad6cc33e16d15175b395e6ab140dab6f603",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:40.699002+00:00",
+    "rows": 18703,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2022-04-03__2022-07-01__csv_raw_external__fold002.csv",
+    "start_ts": "2022-04-04T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2022-07-04__2022-09-29__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2022-07-04__2022-09-29__csv_raw_external",
+    "end_ts": "2022-09-29T23:55:00+00:00",
+    "file_bytes": 1098275,
+    "file_sha256": "sha256:7665e849197f0340fda91d0dd7d02a61d85407fc80b768ab95afaf45ac8a4988",
+    "fingerprint_sha256": "sha256:a7144e2e372bc5aed0d3457c49d0ff2bd6cc6e9832c030572d2b39a70a7c39be",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:41.202808+00:00",
+    "rows": 18430,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2022-07-02__2022-09-29__csv_raw_external__fold003.csv",
+    "start_ts": "2022-07-04T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2022-09-30__2022-12-28__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2022-09-30__2022-12-28__csv_raw_external",
+    "end_ts": "2022-12-28T23:55:00+00:00",
+    "file_bytes": 1079177,
+    "file_sha256": "sha256:88c630cf9dc282b433a9e4647e8d3e5a5741aa8968878a081996a446c03bc862",
+    "fingerprint_sha256": "sha256:5d67fb4821d39c475ad3bed82aa2b4df310be049493cb4d24d5b02468637d146",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:41.680687+00:00",
+    "rows": 18141,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2022-09-30__2022-12-28__csv_raw_external__fold004.csv",
+    "start_ts": "2022-09-30T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2022-12-29__2023-03-28__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2022-12-29__2023-03-28__csv_raw_external",
+    "end_ts": "2023-03-28T23:55:00+00:00",
+    "file_bytes": 1095476,
+    "file_sha256": "sha256:983e8c7c2edf62f9927f6b9f67c2f3d262e10f9fd0d4475ad5146b8687f1e4dc",
+    "fingerprint_sha256": "sha256:fab1bf2eb751fe2aef07f12b2f06b9d12edaf7a73db502151be5bb745a63c7ba",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:42.159374+00:00",
+    "rows": 18427,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2022-12-29__2023-03-28__csv_raw_external__fold005.csv",
+    "start_ts": "2022-12-29T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2023-03-29__2023-06-26__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2023-03-29__2023-06-26__csv_raw_external",
+    "end_ts": "2023-06-26T23:55:00+00:00",
+    "file_bytes": 1095399,
+    "file_sha256": "sha256:9114a24c9be6ae3b62aa41fdf3926698bde8aea600dc9b13b6fbba15176d7905",
+    "fingerprint_sha256": "sha256:7ca25d69fbe055990061bf1c5fea4c6d678dcb1a310ccad1b739aab14fa5ff18",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:42.639575+00:00",
+    "rows": 18416,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2023-03-29__2023-06-26__csv_raw_external__fold006.csv",
+    "start_ts": "2023-03-29T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2023-06-27__2023-09-22__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2023-06-27__2023-09-22__csv_raw_external",
+    "end_ts": "2023-09-22T23:55:00+00:00",
+    "file_bytes": 1094988,
+    "file_sha256": "sha256:2b04c43b73d8a6e9da3e4af6385b00f681aeea8f1bd1e3810806d54cf802443a",
+    "fingerprint_sha256": "sha256:f73b9c7b5995c07e60a6c807972a1e741c8e752a7c33999cc9a002a646704f4f",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:43.112357+00:00",
+    "rows": 18413,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2023-06-27__2023-09-24__csv_raw_external__fold007.csv",
+    "start_ts": "2023-06-27T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2023-09-25__2023-12-22__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2023-09-25__2023-12-22__csv_raw_external",
+    "end_ts": "2023-12-22T23:55:00+00:00",
+    "file_bytes": 1112448,
+    "file_sha256": "sha256:ed3ff9e3b0c81a8274b91db0d53043d5bac2ae3dd2da8c6c7846fd140061fcdd",
+    "fingerprint_sha256": "sha256:b2ae1c9c6936226332c82ce211fa4edef525af60e7c7ee853508633254ce0385",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:43.610703+00:00",
+    "rows": 18719,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2023-09-25__2023-12-23__csv_raw_external__fold008.csv",
+    "start_ts": "2023-09-25T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2023-12-26__2024-03-22__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2023-12-26__2024-03-22__csv_raw_external",
+    "end_ts": "2024-03-22T23:55:00+00:00",
+    "file_bytes": 1079491,
+    "file_sha256": "sha256:591960547e5510f093492a53408111431a9a9af4c59e7695c72c518601048a24",
+    "fingerprint_sha256": "sha256:2c8af89cd2d2b55299bc74461551611dcdb8bcf13949a490e3e18650f2114a2a",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:44.103168+00:00",
+    "rows": 18144,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2023-12-24__2024-03-22__csv_raw_external__fold009.csv",
+    "start_ts": "2023-12-26T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2024-03-25__2024-06-20__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2024-03-25__2024-06-20__csv_raw_external",
+    "end_ts": "2024-06-20T23:55:00+00:00",
+    "file_bytes": 1098488,
+    "file_sha256": "sha256:9bf8e1ffc2edfb533bb9618b09848ec27440b0329e309a897ce980efec3f5920",
+    "fingerprint_sha256": "sha256:8ca066ee74f940acc342faeab462e27e69c3dad918724efa92d1ecd7a8f18d8b",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:44.585737+00:00",
+    "rows": 18432,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2024-03-23__2024-06-20__csv_raw_external__fold010.csv",
+    "start_ts": "2024-03-25T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2024-06-21__2024-09-18__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2024-06-21__2024-09-18__csv_raw_external",
+    "end_ts": "2024-09-18T23:55:00+00:00",
+    "file_bytes": 1098217,
+    "file_sha256": "sha256:3b7ab489ad460ef9b5cfe743338d5531b8f8e644cd8b609959faef8eca523f98",
+    "fingerprint_sha256": "sha256:5ebe7bae0fe5fcc1ba06d8df8381120f8d06fbae05812596189584a8902a7ab1",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:45.063874+00:00",
+    "rows": 18430,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2024-06-21__2024-09-18__csv_raw_external__fold011.csv",
+    "start_ts": "2024-06-21T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2024-09-19__2024-12-17__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2024-09-19__2024-12-17__csv_raw_external",
+    "end_ts": "2024-12-17T23:55:00+00:00",
+    "file_bytes": 1098547,
+    "file_sha256": "sha256:04c5debcd6e6721c9cef6877f69876802655c4c6a4ad6c97efeea65c586c6690",
+    "fingerprint_sha256": "sha256:1ad7d5c7cd584c6785f6908f1f18dda6b2d616f931fb759d952dc36bd7866610",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:45.548627+00:00",
+    "rows": 18432,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2024-09-19__2024-12-17__csv_raw_external__fold012.csv",
+    "start_ts": "2024-09-19T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2024-12-18__2024-12-31__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2024-12-18__2024-12-31__csv_raw_external",
+    "end_ts": "2024-12-31T23:55:00+00:00",
+    "file_bytes": 154407,
+    "file_sha256": "sha256:7ada08d2858a90993b63261f14101287daea6a5d78369feaca4db9130a292cba",
+    "fingerprint_sha256": "sha256:4c55eb4ae76cb9770dc358881513071c7a9073d83e598aae112037ce3184e424",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-04T22:35:45.972285+00:00",
+    "rows": 2592,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/derived/walk_forward/20260204_223539_935980_783baf33/EURUSD_M5_2024-12-18__2024-12-31__csv_raw_external__fold013.csv",
+    "start_ts": "2024-12-18T00:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2024-12-27__2024-12-31__csv_raw_external": {
+    "dataset_id": "EURUSD_M5_2024-12-27__2024-12-31__csv_raw_external",
+    "end_ts": "2024-12-31T23:55:00+00:00",
+    "file_bytes": 35600,
+    "file_sha256": "sha256:fe2bf48b9538dc67c0f5b626dd16faaba14f2c4e219f66674cd6561d91af3422",
+    "fingerprint_sha256": "sha256:2ab2969d6e784adc7bb1a288f787e3d870f5bc8a96d3f3cd92951b87d0557004",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-05T18:50:37.644712+00:00",
+    "rows": 600,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/raw/eurusd_m5_tail_600.csv",
+    "start_ts": "2024-12-27T22:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2024-12-27__2024-12-31__csv_raw_external__cut_before_exit": {
+    "dataset_id": "EURUSD_M5_2024-12-27__2024-12-31__csv_raw_external__cut_before_exit",
+    "end_ts": "2024-12-31T10:45:00+00:00",
+    "file_bytes": 28870,
+    "file_sha256": "sha256:c19c07428c2fcee04dde57e6e8d077d975276dc7cc72655a8bd83841a22ffec5",
+    "fingerprint_sha256": "sha256:41c3c157440509d30db6a6a798d26a150a27a6f7ed0c7977a59620eb0e5ca173",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-05T19:07:30.284167+00:00",
+    "rows": 442,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/raw/eurusd_m5_tail_cut_before_exit.csv",
+    "start_ts": "2024-12-27T22:00:00+00:00",
+    "time_col": "__index__"
+  },
+  "EURUSD_M5_2026-01-01__2026-01-02__csv": {
+    "dataset_id": "EURUSD_M5_2026-01-01__2026-01-02__csv",
+    "end_ts": "2026-01-02T00:55:00+00:00",
+    "file_bytes": 18489,
+    "file_sha256": "sha256:87d8e5e635232d16317e57f9e092318cc588ec1da31a5ff4b57639818200cdcd",
+    "fingerprint_sha256": "sha256:1806646f96d3f3c4e924a06da1558f1d975c185e5fb22284e33d77d94e3fa417",
+    "fingerprint_version": "v1.1",
+    "price_cols": [
+      "open",
+      "high",
+      "low",
+      "close"
+    ],
+    "registered_at_utc": "2026-02-05T19:52:52.164948+00:00",
+    "rows": 300,
+    "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
+    "source_path": "data/example_bars.csv",
+    "start_ts": "2026-01-01T00:00:00+00:00",
+    "time_col": "__index__"
+  },
   "EURUSD_M5_2026-01-01__2026-01-02__csv_example": {
     "dataset_id": "EURUSD_M5_2026-01-01__2026-01-02__csv_example",
     "end_ts": "2026-01-02T00:55:00+00:00",
@@ -12,7 +352,7 @@
       "low",
       "close"
     ],
-    "registered_at_utc": "2026-01-30T22:40:07.221137+00:00",
+    "registered_at_utc": "2026-02-02T16:14:17.188879+00:00",
     "rows": 300,
     "schema_sha256": "sha256:5a7e79a957abb50b551c61332679e21d2286df6ffc09f6360621625cc4694d4d",
     "source_path": "data/example_bars.csv",

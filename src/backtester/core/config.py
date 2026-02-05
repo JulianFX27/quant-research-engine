@@ -19,27 +19,43 @@ class RunConfig:
 
 
 def _as_float(d: Dict[str, Any], key: str, default: Optional[float] = None) -> Optional[float]:
+    """
+    Parse float-like values. If the key exists but value is None, treat it as "unset"
+    and return default. This allows YAML null to mean "disabled/unlimited" where appropriate.
+    """
     if key not in d:
         return default
+    v = d.get(key)
+    if v is None:
+        return default
     try:
-        return float(d[key])
+        return float(v)
     except Exception as e:
-        raise ValueError(f"Invalid '{key}': expected float-like, got {d[key]!r}") from e
+        raise ValueError(f"Invalid '{key}': expected float-like, got {v!r}") from e
 
 
 def _as_int(d: Dict[str, Any], key: str, default: Optional[int] = None) -> Optional[int]:
+    """
+    Parse int-like values. If the key exists but value is None, treat it as "unset"
+    and return default. This allows YAML null to mean "disabled/unlimited" where appropriate.
+    """
     if key not in d:
         return default
+    v = d.get(key)
+    if v is None:
+        return default
     try:
-        return int(d[key])
+        return int(v)
     except Exception as e:
-        raise ValueError(f"Invalid '{key}': expected int-like, got {d[key]!r}") from e
+        raise ValueError(f"Invalid '{key}': expected int-like, got {v!r}") from e
 
 
 def _as_bool(d: Dict[str, Any], key: str, default: Optional[bool] = None) -> Optional[bool]:
     if key not in d:
         return default
     v = d[key]
+    if v is None:
+        return default
     if isinstance(v, bool):
         return v
     if isinstance(v, str):
@@ -163,7 +179,6 @@ def validate_run_config(cfg: dict) -> None:
     # ---- Execution ----
     exe = cfg["execution"]
 
-    # execution.policy_id (optional, used by C2 resolver; here only basic type check)
     if "policy_id" in exe:
         pid = exe.get("policy_id")
         if not isinstance(pid, str) or not pid.strip():

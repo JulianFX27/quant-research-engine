@@ -1,3 +1,4 @@
+# scripts/run_batch.py
 from __future__ import annotations
 
 import argparse
@@ -6,7 +7,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import yaml
@@ -33,6 +34,13 @@ LEADERBOARD_COLUMNS: List[str] = [
     "symbol",
     "timeframe",
     "strategy_name",
+    # Run validity (research-grade)
+    "run_status",
+    "invalid_eof",
+    "valid_trades",
+    "valid_trade_ratio",
+    "eof_incomplete_count",
+    "eof_forced_count",
     # Execution policy / effective execution
     "execution_policy_id",
     "execution_fill_mode",
@@ -72,6 +80,11 @@ LEADERBOARD_COLUMNS: List[str] = [
     "median_hold_minutes",
     "min_hold_minutes",
     "max_hold_minutes",
+    # Exit aggregates (optional but useful)
+    "forced_exits_total",
+    "forced_eof_total",
+    "eof_exits_total",
+    "non_forced_exits_total",
     # R-space metrics (research-grade)
     "n_trades_with_risk",
     "expectancy_R",
@@ -154,7 +167,7 @@ def _compute_dataset_compat(rows: List[Dict[str, Any]]) -> str:
     - MIXED: more than one distinct non-null dataset_fp8 exists
     - UNKNOWN: no dataset_fp8 available at all
     """
-    fps = []
+    fps: List[str] = []
     for r in rows:
         fp = _norm_fp8(r.get("dataset_fp8"))
         if fp:
@@ -165,6 +178,19 @@ def _compute_dataset_compat(rows: List[Dict[str, Any]]) -> str:
     if len(uniq) == 1:
         return "OK"
     return "MIXED"
+
+
+def _as_bool(x: Any) -> Optional[bool]:
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    if s in {"true", "1", "yes"}:
+        return True
+    if s in {"false", "0", "no"}:
+        return False
+    return None
 
 
 def _row_from_result(r: Dict[str, Any], batch_id: str, dataset_compat: str) -> Dict[str, Any]:
@@ -184,6 +210,13 @@ def _row_from_result(r: Dict[str, Any], batch_id: str, dataset_compat: str) -> D
         "symbol": r.get("symbol"),
         "timeframe": r.get("timeframe"),
         "strategy_name": r.get("strategy_name"),
+        # Run validity
+        "run_status": m.get("run_status"),
+        "invalid_eof": _as_bool(m.get("invalid_eof")),
+        "valid_trades": m.get("valid_trades"),
+        "valid_trade_ratio": m.get("valid_trade_ratio"),
+        "eof_incomplete_count": m.get("eof_incomplete_count"),
+        "eof_forced_count": m.get("eof_forced_count"),
         # Execution policy (effective)
         "execution_policy_id": m.get("execution_policy_id"),
         "execution_fill_mode": m.get("execution_fill_mode"),
@@ -223,6 +256,11 @@ def _row_from_result(r: Dict[str, Any], batch_id: str, dataset_compat: str) -> D
         "median_hold_minutes": m.get("median_hold_minutes"),
         "min_hold_minutes": m.get("min_hold_minutes"),
         "max_hold_minutes": m.get("max_hold_minutes"),
+        # Exit aggregates
+        "forced_exits_total": m.get("forced_exits_total"),
+        "forced_eof_total": m.get("forced_eof_total"),
+        "eof_exits_total": m.get("eof_exits_total"),
+        "non_forced_exits_total": m.get("non_forced_exits_total"),
         # R-space
         "n_trades_with_risk": m.get("n_trades_with_risk"),
         "expectancy_R": m.get("expectancy_R"),
@@ -268,6 +306,13 @@ def main() -> None:
         "--policy-sweep",
         default=None,
         help="Comma-separated list of policy_ids to run per config (expands runs). Example: baseline,stress_spread_2",
+    )
+
+    # Leaderboard filtering (research-grade)
+    ap.add_argument(
+        "--rank-only-valid",
+        action="store_true",
+        help="If set: exclude runs marked invalid_eof==True from ranking (still written to CSV).",
     )
 
     args = ap.parse_args()
@@ -346,13 +391,40 @@ def main() -> None:
     rows = [r for r in rows if not _is_header_like_row(r)]
     df = pd.DataFrame(rows).reindex(columns=LEADERBOARD_COLUMNS)
 
-    df = df.sort_values(
-        by=["expectancy_R", "total_pnl", "winrate", "n_trades"],
-        ascending=[False, False, False, False],
-        na_position="last",
-    )
+    # Ranking view: optionally exclude invalid EOF runs from sorting priority
+    rank_df = df.copy()
+    if args.rank_only_valid:
+        rank_df = rank_df[~(rank_df["invalid_eof"] == True)]  # noqa: E712
 
-    df.to_csv(leaderboard_path, index=False)
+    # Sort ranking with validity first (OK > forced exits present > invalid)
+    # We keep a stable CSV containing all; sorting is applied to full df by default,
+    # or by rank_df if --rank-only-valid is used.
+    sort_df = rank_df if args.rank_only_valid else df
+
+    # Add helper sort keys (not persisted)
+    sort_df = sort_df.copy()
+    sort_df["_is_ok"] = (sort_df["run_status"] == "OK")
+    sort_df["_is_ok_forced"] = (sort_df["run_status"] == "OK_FORCED_EXITS_PRESENT")
+    sort_df["_valid_class"] = sort_df["_is_ok"].astype(int) * 2 + sort_df["_is_ok_forced"].astype(int) * 1
+
+    sort_df = sort_df.sort_values(
+        by=["_valid_class", "expectancy_R", "total_pnl", "winrate", "n_trades"],
+        ascending=[False, False, False, False, False],
+        na_position="last",
+    ).drop(columns=["_is_ok", "_is_ok_forced", "_valid_class"])
+
+    # If we used rank_only_valid, we still want to write ALL rows, but ordered as:
+    # 1) ranked rows (valid) first, 2) then the rest.
+    if args.rank_only_valid:
+        ranked_keys = set(zip(sort_df["config_path"], sort_df["policy_id"], sort_df["run_id"]))
+        rest = df.copy()
+        rest["_k"] = list(zip(rest["config_path"], rest["policy_id"], rest["run_id"]))
+        rest = rest[~rest["_k"].isin(ranked_keys)].drop(columns=["_k"])
+        out_df = pd.concat([sort_df, rest], ignore_index=True)
+    else:
+        out_df = sort_df
+
+    out_df.to_csv(leaderboard_path, index=False)
 
     batch_manifest = {
         "batch_id": batch_id,
@@ -370,12 +442,15 @@ def main() -> None:
         "n_success": len(results),
         "n_errors": len(errors),
         "errors": errors,
+        "rank_only_valid": bool(args.rank_only_valid),
     }
     manifest_path.write_text(json.dumps(batch_manifest, indent=2))
 
     print("Batch done.")
     print(f"Dataset compat: {dataset_compat}")
     print(f"Leaderboard: {leaderboard_path}")
+    if args.rank_only_valid:
+        print("Ranking policy: VALID ONLY (invalid EOF excluded from ranking)")
     if errors:
         print(f"Errors: {len(errors)} (see {manifest_path})")
 

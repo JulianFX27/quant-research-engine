@@ -5,3 +5,8 @@ __pycache__/
 .DS_Store
 
 data/registry/
+data/raw/
+data/derived/
+*.bak
+*.bak2
+*.bak3

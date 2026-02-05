@@ -4,13 +4,13 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import yaml
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
 import pandas as pd
+import yaml
 
 from backtester.core.config import validate_run_config
 from backtester.data.dataset_fingerprint import build_dataset_id
@@ -227,6 +227,41 @@ def _flatten_forced_exits_into_metrics(metrics: Dict[str, Any], risk_report: Dic
         metrics["forced_exits_total"] = 0
 
 
+def _compute_run_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Research-grade run status for leaderboard hygiene.
+
+    Policy:
+      - Any EOF-incompleteness invalidates the sample for ranking:
+          * forced_exits__EOF_SKIPPED_BY_POLICY > 0  (position open at EOF but policy forbids forcing close)
+          * forced_exits__EOF > 0                    (engine forced close at EOF)
+          * forced_eof_total/eof_exits_total > 0     (trade exits recorded as EOF/force_eof)
+    """
+    forced_total = int(metrics.get("forced_exits_total", 0) or 0)
+
+    eof_forced = int(metrics.get("forced_exits__EOF", 0) or 0)
+    eof_skipped = int(metrics.get("forced_exits__EOF_SKIPPED_BY_POLICY", 0) or 0)
+
+    forced_eof_total = int(metrics.get("forced_eof_total", 0) or 0)
+    eof_exits_total = int(metrics.get("eof_exits_total", 0) or 0)
+
+    invalid_eof = (eof_forced + eof_skipped + forced_eof_total + eof_exits_total) > 0
+
+    status = "OK"
+    if invalid_eof:
+        status = "INVALID_SAMPLE_EOF"
+    elif forced_total > 0:
+        # Valid, but note forced exits are present (e.g. max_hold policy)
+        status = "OK_FORCED_EXITS_PRESENT"
+
+    return {
+        "run_status": status,
+        "invalid_eof": bool(invalid_eof),
+        "eof_incomplete_count": int(eof_skipped),
+        "eof_forced_count": int(eof_forced),
+    }
+
+
 def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     # Apply execution policy BEFORE validation
     pol_res = apply_execution_policy(cfg)
@@ -352,14 +387,39 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     # Entry gate (v1 + v2) into metrics
     _flatten_entry_gate_into_metrics(metrics_raw, risk_report)
 
-    # NEW: dropped (unfillable) entries
+    # Dropped (unfillable) entries
     _flatten_fill_dropped_into_metrics(metrics_raw, risk_report)
 
-    # NEW: engine utilization
+    # Engine utilization
     _flatten_engine_util_into_metrics(metrics_raw, risk_report)
 
-    # NEW: forced exits (EOF / max_hold, etc.)
+    # Forced exits (EOF / max_hold, etc.)
     _flatten_forced_exits_into_metrics(metrics_raw, risk_report)
+
+    # ---------------------------
+    # Research-grade validity layer
+    # ---------------------------
+    # Trade "válido" = salida NO forzada (ej: TP/SL/other natural exits)
+    n_trades = int(metrics_raw.get("n_trades", 0) or 0)
+    forced_trades = int(metrics_raw.get("forced_exits_total", 0) or 0)
+    non_forced = int(metrics_raw.get("non_forced_exits_total", 0) or max(0, n_trades - forced_trades))
+    metrics_raw["valid_trades"] = int(non_forced)
+
+    attempted = metrics_raw.get("entry_gate_v2_attempted_entries")
+    if attempted is None:
+        attempted = metrics_raw.get("entry_gate_attempted_entries")
+    if attempted is None:
+        attempted = n_trades
+
+    try:
+        attempted_i = int(attempted or 0)
+    except Exception:
+        attempted_i = 0
+
+    metrics_raw["valid_trade_ratio"] = (non_forced / attempted_i) if attempted_i > 0 else None
+
+    status_block = _compute_run_status(metrics_raw)
+    metrics_raw.update(status_block)
 
     metrics = _sanitize_for_json(metrics_raw)
 
@@ -415,6 +475,10 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
         "risk": risk_cfg_resolved,
         "risk_report": risk_report,
         "dataset": dataset_dict,
+        # Quick-glance run validity
+        "run_status": metrics.get("run_status"),
+        "run_invalid_eof": metrics.get("invalid_eof"),
+        "run_valid_trades": metrics.get("valid_trades"),
         "outputs": {
             "run_dir": str(run_dir),
             "trades": str(trades_path),

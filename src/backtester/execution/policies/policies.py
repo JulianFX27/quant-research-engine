@@ -3,19 +3,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import yaml
 
 
-DEFAULT_POLICIES_PATH = "configs/execution_policies.yaml"
+# Canonical location (new) + legacy fallback (old)
+DEFAULT_POLICIES_PATHS = [
+    "configs/policies/execution_policies.yaml",  # canonical
+    "configs/execution_policies.yaml",           # legacy fallback
+]
 
 
 @dataclass(frozen=True)
 class ExecutionPolicyResult:
     policy_id: str
     policies_path: str
-    overlay: Dict[str, Any]            # what was applied (execution/costs/risk only)
+    overlay: Dict[str, Any]            # applied (execution/costs/risk only)
     cfg_resolved: Dict[str, Any]       # full resolved cfg (copy)
     warnings: list[str]
 
@@ -34,6 +38,32 @@ def _deep_merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _resolve_policies_path(path: str | Path | None) -> Path:
+    """
+    Resolve policies YAML path.
+
+    Resolution order:
+      1) explicit override (execution.policies_path) if provided
+      2) DEFAULT_POLICIES_PATHS (canonical first, then legacy fallback)
+
+    Raises FileNotFoundError with a helpful message if none exist.
+    """
+    if path:
+        p = Path(str(path))
+        if p.exists():
+            return p
+        raise FileNotFoundError(f"EXECUTION_POLICIES_FILE_NOT_FOUND: {p}")
+
+    tried: list[str] = []
+    for s in DEFAULT_POLICIES_PATHS:
+        p = Path(s)
+        tried.append(str(p))
+        if p.exists():
+            return p
+
+    raise FileNotFoundError(f"EXECUTION_POLICIES_FILE_NOT_FOUND: tried {tried}")
+
+
 def _load_policies_yaml(path: str | Path) -> Dict[str, Any]:
     p = Path(path)
     if not p.exists():
@@ -47,11 +77,7 @@ def _load_policies_yaml(path: str | Path) -> Dict[str, Any]:
     #   policies: { ... }
     # or:
     #   { ... }  (direct map)
-    if "policies" in data:
-        policies = data.get("policies")
-    else:
-        policies = data
-
+    policies = data.get("policies") if "policies" in data else data
     if not isinstance(policies, dict):
         raise ValueError("Invalid policies YAML: 'policies' must be a mapping/dict")
 
@@ -72,41 +98,54 @@ def _extract_policy_id_from_cfg(cfg: Dict[str, Any]) -> Optional[str]:
     return _normalize_policy_id(exe.get("policy_id"))
 
 
-def _extract_policies_path_from_cfg(cfg: Dict[str, Any]) -> str:
+def _extract_policies_path_from_cfg(cfg: Dict[str, Any]) -> Optional[str]:
     """
     Allows override via:
       execution.policies_path
-    Otherwise uses DEFAULT_POLICIES_PATH.
+    Otherwise returns None and resolver will use DEFAULT_POLICIES_PATHS.
     """
     exe = cfg.get("execution", {}) or {}
     if isinstance(exe, dict) and exe.get("policies_path"):
         return str(exe["policies_path"])
-    return DEFAULT_POLICIES_PATH
+    return None
 
 
 def apply_execution_policy(cfg: Dict[str, Any]) -> Optional[ExecutionPolicyResult]:
     """
-    Opción B (research-friendly, baseline-safe):
+    Research-friendly (baseline-safe):
       - If no policy_id: return None (cfg unchanged).
-      - If policy_id == "baseline": treat as no-op but still record policy meta.
-      - Otherwise:
-          - load policies YAML
+      - If policy_id present:
+          - resolve and load policies YAML (canonical path + legacy fallback)
+          - support policy definitions in either format:
+              A) direct:
+                 baseline:
+                   execution: {...}
+                   costs: {...}
+                   risk: {...}
+              B) nested under overlay:
+                 baseline:
+                   overlay:
+                     execution: {...}
+                     costs: {...}
+                     risk: {...}
           - apply overlay only into: execution/costs/risk
-          - return resolved cfg + overlay for auditing
+          - return resolved cfg + overlay + warnings for auditing
 
-    The caller should run validate_run_config() on cfg_resolved after applying.
+    Caller should validate cfg_resolved after applying.
     """
     policy_id = _extract_policy_id_from_cfg(cfg)
     if not policy_id:
         return None
 
-    policies_path = _extract_policies_path_from_cfg(cfg)
+    override_path = _extract_policies_path_from_cfg(cfg)
+    policies_path = _resolve_policies_path(override_path)
+
     policies = _load_policies_yaml(policies_path)
 
     if policy_id not in policies:
         raise ValueError(
             "EXECUTION_POLICY_NOT_FOUND: "
-            f"{policy_id!r} not present in {policies_path}. "
+            f"{policy_id!r} not present in {str(policies_path)}. "
             "Fix: add it to execution_policies.yaml or remove execution.policy_id."
         )
 
@@ -116,10 +155,21 @@ def apply_execution_policy(cfg: Dict[str, Any]) -> Optional[ExecutionPolicyResul
     if not isinstance(raw_pol, dict):
         raise ValueError(f"Invalid policy '{policy_id}': expected mapping/dict, got {type(raw_pol).__name__}")
 
-    # Only allow these top-level overlay sections (baseline safety).
+    warnings: list[str] = []
+
+    # Support nested 'overlay' schema
+    if "overlay" in raw_pol:
+        ov = raw_pol.get("overlay")
+        if ov is None:
+            raw_pol = {}
+        elif isinstance(ov, dict):
+            raw_pol = ov
+        else:
+            raise ValueError(f"Invalid policy '{policy_id}': 'overlay' must be a dict, got {type(ov).__name__}")
+
+    # Only allow these top-level overlay sections (baseline safety)
     allowed_top = {"execution", "costs", "risk"}
     overlay: Dict[str, Any] = {}
-    warnings: list[str] = []
 
     for k, v in raw_pol.items():
         if k in allowed_top:
@@ -148,7 +198,7 @@ def apply_execution_policy(cfg: Dict[str, Any]) -> Optional[ExecutionPolicyResul
 
     return ExecutionPolicyResult(
         policy_id=policy_id,
-        policies_path=policies_path,
+        policies_path=str(policies_path),
         overlay=overlay,
         cfg_resolved=cfg_resolved,
         warnings=warnings,
