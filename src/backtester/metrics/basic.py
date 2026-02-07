@@ -39,7 +39,10 @@ def _calc_max_consecutive_losses(values: np.ndarray) -> int:
 def _calc_drawdown(equity: np.ndarray) -> Tuple[float, float]:
     """
     Returns (max_dd_abs, max_dd_pct) where pct is relative to peak.
-    If peak <= 0, pct is computed only when peak > 0.
+
+    IMPORTANT:
+      - Equity is expected to be strictly interpretable (e.g., includes an initial equity > 0).
+      - If peak <= 0, pct is not updated (remains 0.0).
     """
     if equity.size == 0:
         return 0.0, 0.0
@@ -70,6 +73,10 @@ def summarize_trades(trades: List[Trade]) -> Dict[str, Any]:
     - Hold-time metrics
     - Exit reason counts + forced/EOF aggregates
     - R-space metrics (requires risk_price and qty; fallback to abs(entry-sl) if needed)
+
+    Option A policy:
+      - PnL-space equity uses an explicit initial equity of 1.0 to make DD% stable.
+      - R-space drawdown reported in absolute R only (DD% in R-space is set to None).
     """
     if not trades:
         return {"n_trades": 0}
@@ -91,7 +98,9 @@ def summarize_trades(trades: List[Trade]) -> Dict[str, Any]:
         "profit_factor": float(wins.sum() / abs(losses.sum())) if abs(losses.sum()) > 1e-12 else float("inf"),
     }
 
-    equity = np.cumsum(pnls)
+    # Option A: stable equity base for meaningful drawdown%
+    initial_equity = 1.0
+    equity = initial_equity + np.cumsum(pnls)
     max_dd_abs, max_dd_pct = _calc_drawdown(equity)
     out["max_drawdown_abs"] = max_dd_abs
     out["max_drawdown_pct"] = max_dd_pct
@@ -206,10 +215,11 @@ def summarize_trades(trades: List[Trade]) -> Dict[str, Any]:
 
         out["max_consecutive_losses_R"] = _calc_max_consecutive_losses(R)
 
+        # Option A: R-space drawdown in absolute R only (DD% in R-space is not meaningful/stable)
         eq_R = np.cumsum(R)
-        dd_R_abs, dd_R_pct = _calc_drawdown(eq_R)
-        out["max_drawdown_R_abs"] = dd_R_abs
-        out["max_drawdown_R_pct"] = dd_R_pct
+        dd_R_abs, _dd_R_pct_unused = _calc_drawdown(eq_R)
+        out["max_drawdown_R_abs"] = float(dd_R_abs)
+        out["max_drawdown_R_pct"] = None
     else:
         out["n_trades_with_risk"] = 0
         out["expectancy_R"] = None
