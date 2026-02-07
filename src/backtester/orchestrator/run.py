@@ -75,6 +75,151 @@ def _get_registry_dir(cfg: Dict[str, Any]) -> str:
     return str(dsreg.get("registry_dir") or "data/registry")
 
 
+def _norm_forced_dataset_id(x: Any) -> str | None:
+    """
+    Normalize cfg.dataset_id:
+      - None/"" -> None
+      - strip spaces
+      - reject non-strings
+    """
+    if x is None:
+        return None
+    if not isinstance(x, str):
+        return None
+    s = x.strip()
+    return s or None
+
+
+def _norm_int(x: Any) -> int | None:
+    """Best-effort normalize int-like values. Returns None if cannot parse."""
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return int(x)
+    try:
+        if isinstance(x, str) and x.strip() == "":
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+
+def _capture_policy_sensitive_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Capture overrides that must remain stable even if an execution policy overlay runs.
+
+    Rationale:
+      - Walk-forward runner intentionally sets risk.eof_buffer_bars per fold.
+      - Some execution policy overlays may default/override risk.* fields; we want
+        explicit runner/user overrides to win.
+
+    Returns a dict of override values (normalized), with None meaning "not set".
+    """
+    risk = cfg.get("risk", {}) or {}
+    return {
+        "risk.eof_buffer_bars": _norm_int(risk.get("eof_buffer_bars", None)),
+    }
+
+
+def _apply_policy_sensitive_overrides(cfg_resolved: Dict[str, Any], overrides: Dict[str, Any]) -> None:
+    """Re-apply captured overrides onto cfg_resolved with highest precedence."""
+    if not isinstance(cfg_resolved, dict):
+        return
+
+    eofb = overrides.get("risk.eof_buffer_bars", None)
+    if eofb is not None:
+        cfg_resolved.setdefault("risk", {})
+        if not isinstance(cfg_resolved["risk"], dict):
+            cfg_resolved["risk"] = {}
+        cfg_resolved["risk"]["eof_buffer_bars"] = int(eofb)
+
+
+def _get_validity_mode(cfg: Dict[str, Any]) -> str | None:
+    """
+    Best-effort: validity mode can live at top-level (runner arg) or inside risk.
+    """
+    v = cfg.get("validity_mode")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    risk = cfg.get("risk", {}) or {}
+    v2 = risk.get("validity_mode")
+    if isinstance(v2, str) and v2.strip():
+        return v2.strip()
+    return None
+
+
+def _extract_max_holding_bars_from_cfg(cfg: Dict[str, Any]) -> int | None:
+    """
+    Best-effort: max_holding_bars can be declared in several places depending on wiring.
+
+    We support:
+      - cfg.risk.guardrails.max_holding_bars
+      - cfg.risk.guardrails.guardrails_cfg.max_holding_bars
+      - cfg.guardrails.max_holding_bars
+      - cfg.guardrails_cfg.max_holding_bars
+    """
+    risk = cfg.get("risk", {}) or {}
+
+    g = risk.get("guardrails")
+    if isinstance(g, dict):
+        v = _norm_int(g.get("max_holding_bars"))
+        if v is not None:
+            return v
+        gcfg = g.get("guardrails_cfg")
+        if isinstance(gcfg, dict):
+            v2 = _norm_int(gcfg.get("max_holding_bars"))
+            if v2 is not None:
+                return v2
+
+    g2 = cfg.get("guardrails")
+    if isinstance(g2, dict):
+        v3 = _norm_int(g2.get("max_holding_bars"))
+        if v3 is not None:
+            return v3
+
+    gcfg2 = cfg.get("guardrails_cfg")
+    if isinstance(gcfg2, dict):
+        v4 = _norm_int(gcfg2.get("max_holding_bars"))
+        if v4 is not None:
+            return v4
+
+    return None
+
+
+def _enforce_strict_no_eof_entry_safety(cfg_resolved: Dict[str, Any]) -> None:
+    """
+    If validity_mode=strict_no_eof, enforce that eof_buffer_bars is at least max_holding_bars.
+
+    Why:
+      - Your invalid folds show trades opened ~60 bars before EOF and forced-closed at EOF.
+      - With eof_buffer_bars=50, entry-gate blocks only last 50 bars, so those entries pass.
+      - If max_holding_bars=120, then ANY entry in last 120 bars can run past EOF -> FORCE_EOF.
+      - Therefore strict_no_eof requires eof_buffer_bars >= max_holding_bars (or equivalent gating).
+    """
+    mode = _get_validity_mode(cfg_resolved)
+    if mode != "strict_no_eof":
+        return
+
+    cfg_resolved.setdefault("risk", {})
+    if not isinstance(cfg_resolved["risk"], dict):
+        cfg_resolved["risk"] = {}
+
+    risk = cfg_resolved["risk"]
+
+    eofb = _norm_int(risk.get("eof_buffer_bars"))
+    max_hold = _extract_max_holding_bars_from_cfg(cfg_resolved)
+
+    if max_hold is None:
+        return
+
+    # If eof buffer missing, treat as 0.
+    eofb_eff = int(eofb or 0)
+    if eofb_eff < int(max_hold):
+        risk["eof_buffer_bars"] = int(max_hold)
+        # leave force_exit_on_eof as-is; strict_no_eof targets prevention (entry gating),
+        # but engine still may force-exit legacy positions; that will still be flagged invalid.
+
+
 def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, Any, str]:
     """
     Returns:
@@ -82,8 +227,13 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
 
     Design:
       - loader may require a dataset_id; we pass provisional to compute metadata
-      - then compute dataset_id_final from canonical start/end and rebind meta
+      - then compute dataset_id_final from canonical start/end OR respect cfg.dataset_id if provided
       - only dataset_id_final is ever registered
+
+    IMPORTANT (WF):
+      - Walk-forward produces derived slices whose content can change even if the
+        date range string is the same (e.g., eof-buffer truncation).
+      - Therefore WF must be able to force a content-addressed dataset_id per fold.
     """
     instrument = cfg.get("instrument", {}) or {}
     symbol = str(cfg.get("symbol") or "UNKNOWN")
@@ -98,6 +248,7 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
 
     Path(registry_dir).mkdir(parents=True, exist_ok=True)
 
+    # Provisional id for loader (any string is fine; not registered)
     dataset_id_prov = build_dataset_id(
         instrument=symbol,
         timeframe=timeframe,
@@ -112,13 +263,21 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
         dataset_id=dataset_id_prov,
     )
 
-    dataset_id_final = build_dataset_id(
+    # Default (range-based) dataset_id_final
+    dataset_id_default = build_dataset_id(
         instrument=symbol,
         timeframe=timeframe,
         start_ts=str(dataset_meta.start_ts),
         end_ts=str(dataset_meta.end_ts),
         source=source,
     )
+
+    # ✅ Respect explicit cfg.dataset_id (used by WF fold slices)
+    forced_id = _norm_forced_dataset_id(cfg.get("dataset_id"))
+    if forced_id:
+        dataset_id_final = forced_id
+    else:
+        dataset_id_final = dataset_id_default
 
     dataset_meta_final = replace(dataset_meta, dataset_id=dataset_id_final)
 
@@ -161,6 +320,7 @@ def _flatten_entry_gate_into_metrics(metrics: Dict[str, Any], risk_report: Dict[
     metrics["entry_gate_v2_blocked_total"] = int(eg2.get("blocked_total", 0) or 0)
     metrics["entry_gate_v2_blocked_unique_bars"] = int(eg2.get("blocked_unique_bars", 0) or 0)
 
+    # IMPORTANT: keep reason key stable; engine emits "blocked_v2_by_reason"
     bbr2 = eg2.get("blocked_v2_by_reason") or {}
     if isinstance(bbr2, dict):
         for k, v in bbr2.items():
@@ -251,7 +411,6 @@ def _compute_run_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
     if invalid_eof:
         status = "INVALID_SAMPLE_EOF"
     elif forced_total > 0:
-        # Valid, but note forced exits are present (e.g. max_hold policy)
         status = "OK_FORCED_EXITS_PRESENT"
 
     return {
@@ -263,9 +422,18 @@ def _compute_run_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
+    # ---- Capture overrides that must survive policy overlay (WF correctness) ----
+    policy_overrides = _capture_policy_sensitive_overrides(cfg)
+
     # Apply execution policy BEFORE validation
     pol_res = apply_execution_policy(cfg)
     cfg_resolved = pol_res.cfg_resolved if pol_res is not None else cfg
+
+    # ---- Re-apply overrides AFTER policy overlay (highest precedence) ----
+    _apply_policy_sensitive_overrides(cfg_resolved, policy_overrides)
+
+    # ---- Enforce strict_no_eof safety: eof_buffer_bars >= max_holding_bars ----
+    _enforce_strict_no_eof_entry_safety(cfg_resolved)
 
     validate_run_config(cfg_resolved)
 
@@ -298,7 +466,7 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     costs_cfg = dict(cfg_resolved.get("costs", {}))
     pip_size = float(instrument.get("pip_size", 0.0) or 0.0)
 
-    # Keep "effective" costs in pips for leaderboard traceability (cast to float if present)
+    # Keep effective costs in pips for leaderboard traceability
     spread_pips_eff = costs_cfg.get("spread_pips")
     slippage_pips_eff = costs_cfg.get("slippage_pips")
     try:
@@ -344,7 +512,7 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_raw["costs_spread_pips_effective"] = spread_pips_eff
     metrics_raw["costs_slippage_pips_effective"] = slippage_pips_eff
 
-    # Dataset identity fields (flat) for quick traceability/leaderboard
+    # Dataset identity fields
     metrics_raw["dataset_id"] = dataset_id_final
     metrics_raw["dataset_fp8"] = dataset_meta.fingerprint_short
     metrics_raw["dataset_rows"] = dataset_meta.rows
@@ -357,10 +525,15 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_raw["dataset_file_bytes"] = getattr(dataset_meta, "file_bytes", None)
     metrics_raw["dataset_source_path"] = getattr(dataset_meta, "source_path", None)
 
-    # Risk (flat) for leaderboard / quick inspection
+    # Risk (flat)
     metrics_raw["risk_max_daily_loss_R"] = risk_cfg_resolved.get("max_daily_loss_R")
     metrics_raw["risk_max_trades_per_day"] = risk_cfg_resolved.get("max_trades_per_day")
     metrics_raw["risk_cooldown_bars"] = risk_cfg_resolved.get("cooldown_bars")
+    # Useful for debugging overlay precedence:
+    metrics_raw["risk_eof_buffer_bars"] = risk_cfg_resolved.get("eof_buffer_bars")
+    metrics_raw["risk_force_exit_on_eof"] = risk_cfg_resolved.get("force_exit_on_eof")
+    metrics_raw["validity_mode"] = _get_validity_mode(cfg_resolved)
+    metrics_raw["cfg_max_holding_bars_hint"] = _extract_max_holding_bars_from_cfg(cfg_resolved)
 
     metrics_raw["risk_blocked_by_daily_stop"] = blocked.get("by_daily_stop")
     metrics_raw["risk_blocked_by_max_trades_per_day"] = blocked.get("by_max_trades_per_day")
@@ -368,7 +541,7 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_raw["risk_final_realized_R_today"] = risk_report.get("final_realized_R_today")
     metrics_raw["risk_final_stopped_today"] = risk_report.get("final_stopped_today")
 
-    # Guardrails v2 summary into metrics (optional but useful)
+    # Guardrails v2 summary into metrics
     gr = (risk_report.get("guardrails") or {})
     gr_cfg = (gr.get("guardrails_cfg") or {})
     gr_blocked = (gr.get("blocked") or {})
@@ -384,22 +557,13 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_raw["gr_blocked_by_time_window"] = gr_blocked.get("by_time_window")
     metrics_raw["gr_forced_exit_by_max_holding_bars"] = gr_forced.get("by_max_holding_bars")
 
-    # Entry gate (v1 + v2) into metrics
+    # Flatten audits
     _flatten_entry_gate_into_metrics(metrics_raw, risk_report)
-
-    # Dropped (unfillable) entries
     _flatten_fill_dropped_into_metrics(metrics_raw, risk_report)
-
-    # Engine utilization
     _flatten_engine_util_into_metrics(metrics_raw, risk_report)
-
-    # Forced exits (EOF / max_hold, etc.)
     _flatten_forced_exits_into_metrics(metrics_raw, risk_report)
 
-    # ---------------------------
     # Research-grade validity layer
-    # ---------------------------
-    # Trade "válido" = salida NO forzada (ej: TP/SL/other natural exits)
     n_trades = int(metrics_raw.get("n_trades", 0) or 0)
     forced_trades = int(metrics_raw.get("forced_exits_total", 0) or 0)
     non_forced = int(metrics_raw.get("non_forced_exits_total", 0) or max(0, n_trades - forced_trades))
@@ -437,11 +601,11 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-    # Persist dataset metadata (full) — enforce dataset_id_final explicitly
+    # Persist dataset metadata (full)
     dataset_dict = dataset_meta.to_dict()
     dataset_dict["dataset_id"] = dataset_id_final
 
-    # Persist policy audit block
+    # Persist policy audit
     execution_policy_block: Dict[str, Any] | None = None
     if pol_res is not None:
         execution_policy_block = {
@@ -458,6 +622,12 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
         "symbol": cfg_resolved["symbol"],
         "timeframe": cfg_resolved["timeframe"],
         "data_path": cfg_resolved["data_path"],
+        # IMPORTANT: persist forced dataset_id if present (WF)
+        "dataset_id_forced": _norm_forced_dataset_id(cfg_resolved.get("dataset_id")),
+        # Helpful: persist what was explicitly overridden pre-policy
+        "policy_sensitive_overrides": {
+            "risk.eof_buffer_bars": policy_overrides.get("risk.eof_buffer_bars", None),
+        },
         "instrument": cfg_resolved.get("instrument", {}),
         "dataset_registry": cfg_resolved.get("dataset_registry", {}) or {},
         "strategy": cfg_resolved["strategy"],
@@ -471,11 +641,9 @@ def run_from_config(cfg: Dict[str, Any], out_dir: str | Path) -> Dict[str, Any]:
             "spread_pips_effective": spread_pips_eff,
             "slippage_pips_effective": slippage_pips_eff,
         },
-        # IMPORTANT: persist RESOLVED risk for auditability
         "risk": risk_cfg_resolved,
         "risk_report": risk_report,
         "dataset": dataset_dict,
-        # Quick-glance run validity
         "run_status": metrics.get("run_status"),
         "run_invalid_eof": metrics.get("invalid_eof"),
         "run_valid_trades": metrics.get("valid_trades"),
