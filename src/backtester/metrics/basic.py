@@ -1,259 +1,365 @@
 # src/backtester/metrics/basic.py
 from __future__ import annotations
 
-from dataclasses import asdict
-from typing import Any, Dict, List, Tuple
-
-import numpy as np
-
-from backtester.execution.engine import Trade
+import math
+from typing import Any, Dict, Iterable, List
 
 
-def _to_float_or_none(x: Any) -> float | None:
-    if x is None:
-        return None
+# --- Safety constants (research-grade hygiene) ---
+# Any trade with risk_price <= RISK_EPS is considered invalid for R metrics.
+RISK_EPS: float = 1e-12
+
+# Cap extreme R values to avoid a single bad trade destroying aggregates.
+# This does NOT "hide" issues because we also report extreme counts + max raw |R|.
+R_CAP_ABS: float = 1000.0
+
+
+def _is_finite(x: Any) -> bool:
     try:
+        return x is not None and isinstance(x, (int, float)) and math.isfinite(float(x))
+    except Exception:
+        return False
+
+
+def _safe_float(x: Any, default: float | None = None) -> float | None:
+    try:
+        if x is None:
+            return default
         v = float(x)
-    except (TypeError, ValueError):
+        if not math.isfinite(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        if x is None:
+            return default
+        return int(x)
+    except Exception:
+        return default
+
+
+def _quantile(sorted_vals: List[float], q: float) -> float | None:
+    if not sorted_vals:
         return None
-    if not np.isfinite(v):
+    if q <= 0:
+        return float(sorted_vals[0])
+    if q >= 1:
+        return float(sorted_vals[-1])
+    n = len(sorted_vals)
+    pos = (n - 1) * q
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(sorted_vals[lo])
+    w = pos - lo
+    return float(sorted_vals[lo] * (1 - w) + sorted_vals[hi] * w)
+
+
+def _max_drawdown_abs(equity: List[float]) -> float | None:
+    if not equity:
         return None
-    return float(v)
-
-
-def _calc_max_consecutive_losses(values: np.ndarray) -> int:
-    if values.size == 0:
-        return 0
-    max_streak = 0
-    cur = 0
-    for v in values:
-        if v < 0:
-            cur += 1
-            if cur > max_streak:
-                max_streak = cur
-        else:
-            cur = 0
-    return int(max_streak)
-
-
-def _calc_drawdown(equity: np.ndarray) -> Tuple[float, float]:
-    """
-    Returns (max_dd_abs, max_dd_pct) where pct is relative to peak.
-
-    IMPORTANT:
-      - Equity is expected to be strictly interpretable (e.g., includes an initial equity > 0).
-      - If peak <= 0, pct is not updated (remains 0.0).
-    """
-    if equity.size == 0:
-        return 0.0, 0.0
-
-    peak = float(equity[0])
-    max_dd_abs = 0.0
-    max_dd_pct = 0.0
-
+    peak = equity[0]
+    max_dd = 0.0
     for x in equity:
-        x = float(x)
         if x > peak:
             peak = x
         dd = peak - x
-        if dd > max_dd_abs:
-            max_dd_abs = dd
-        if peak > 0:
-            dd_pct = dd / peak
-            if dd_pct > max_dd_pct:
-                max_dd_pct = dd_pct
-
-    return float(max_dd_abs), float(max_dd_pct)
+        if dd > max_dd:
+            max_dd = dd
+    return float(max_dd)
 
 
-def summarize_trades(trades: List[Trade]) -> Dict[str, Any]:
+def _max_drawdown_pct(equity: List[float]) -> float | None:
+    # pct based on peak value; if peak == 0 then pct undefined
+    if not equity:
+        return None
+    peak = equity[0]
+    max_pct = 0.0
+    for x in equity:
+        if x > peak:
+            peak = x
+        if peak == 0:
+            continue
+        pct = (peak - x) / abs(peak)
+        if pct > max_pct:
+            max_pct = pct
+    return float(max_pct) if max_pct > 0 else 0.0
+
+
+def summarize_trades(trades: Iterable[Any]) -> Dict[str, Any]:
     """
     Research-grade summary.
-    - PnL-space metrics
-    - Hold-time metrics
-    - Exit reason counts + forced/EOF aggregates
-    - R-space metrics (requires risk_price and qty; fallback to abs(entry-sl) if needed)
 
-    Option A policy:
-      - PnL-space equity uses an explicit initial equity of 1.0 to make DD% stable.
-      - R-space drawdown reported in absolute R only (DD% in R-space is set to None).
+    Assumptions about Trade object:
+      - pnl (float)
+      - entry_time / exit_time (optional, iso string)
+      - hold_minutes (optional float)
+      - exit_reason (optional str)
+      - risk_price (optional float): abs(entry - sl) in price units
     """
-    if not trades:
-        return {"n_trades": 0}
+    pnl_list: List[float] = []
+    win_list: List[float] = []
+    loss_list: List[float] = []
+    hold_minutes: List[float] = []
+    exit_reason_counts: Dict[str, int] = {}
 
-    # -------------------------
-    # PnL-space core stats
-    # -------------------------
-    pnls = np.array([_to_float_or_none(getattr(t, "pnl", None)) or 0.0 for t in trades], dtype=float)
-    wins = pnls[pnls > 0]
-    losses = pnls[pnls <= 0]
+    # R-space lists
+    R_list: List[float] = []
+    R_win: List[float] = []
+    R_loss: List[float] = []
 
-    out: Dict[str, Any] = {
-        "n_trades": int(len(trades)),
-        "total_pnl": float(pnls.sum()),
-        "winrate": float((pnls > 0).mean()),
-        "avg_pnl": float(pnls.mean()) if pnls.size else 0.0,
-        "avg_win": float(wins.mean()) if wins.size else 0.0,
-        "avg_loss": float(losses.mean()) if losses.size else 0.0,
-        "profit_factor": float(wins.sum() / abs(losses.sum())) if abs(losses.sum()) > 1e-12 else float("inf"),
-    }
+    # R diagnostics
+    n_trades_with_risk = 0
+    n_trades_bad_risk = 0            # risk_price <= 0 or non-finite
+    n_trades_tiny_risk = 0           # 0 < risk_price <= RISK_EPS
+    n_trades_extreme_R = 0           # |R_raw| > R_CAP_ABS
+    R_max_abs_seen_raw: float | None = None
 
-    # Option A: stable equity base for meaningful drawdown%
-    initial_equity = 1.0
-    equity = initial_equity + np.cumsum(pnls)
-    max_dd_abs, max_dd_pct = _calc_drawdown(equity)
-    out["max_drawdown_abs"] = max_dd_abs
-    out["max_drawdown_pct"] = max_dd_pct
-    out["max_consecutive_losses"] = _calc_max_consecutive_losses(pnls)
-
-    # -------------------------
-    # Hold time
-    # -------------------------
-    hold_mins: list[float] = []
-    for t in trades:
-        et = getattr(t, "entry_time", None)
-        xt = getattr(t, "exit_time", None)
-        if et is None or xt is None:
-            continue
-        try:
-            dt = (xt - et).total_seconds() / 60.0
-        except Exception:
-            continue
-        if np.isfinite(dt) and dt >= 0:
-            hold_mins.append(float(dt))
-
-    if hold_mins:
-        hm = np.array(hold_mins, dtype=float)
-        out["avg_hold_minutes"] = float(hm.mean())
-        out["median_hold_minutes"] = float(np.median(hm))
-        out["min_hold_minutes"] = float(hm.min())
-        out["max_hold_minutes"] = float(hm.max())
-    else:
-        out["avg_hold_minutes"] = None
-        out["median_hold_minutes"] = None
-        out["min_hold_minutes"] = None
-        out["max_hold_minutes"] = None
-
-    # -------------------------
-    # Exit reason counts + aggregates
-    # -------------------------
-    reason_counts: Dict[str, int] = {}
-    for t in trades:
-        r = str(getattr(t, "exit_reason", "") or "UNKNOWN").strip()
-        reason_counts[r] = int(reason_counts.get(r, 0)) + 1
-
-    for r, n in sorted(reason_counts.items()):
-        out[f"exit_reason_count__{r}"] = int(n)
-
+    # forced exit accounting
+    forced_reasons = {"FORCE_EOF", "FORCE_MAX_HOLD", "EOF"}
     forced_exits_total = 0
     forced_eof_total = 0
     eof_exits_total = 0
+    non_forced_exits_total = 0
 
-    for rk, n in reason_counts.items():
-        rk = str(rk)
-        n = int(n)
-        if rk.startswith("FORCE_"):
-            forced_exits_total += n
-            if rk == "FORCE_EOF":
-                forced_eof_total += n
-                eof_exits_total += n  # count EOF even if expressed as FORCE_EOF
-        if rk == "EOF":
-            eof_exits_total += n
+    # Build equity curve in pnl-space for DD
+    equity: List[float] = []
+    eq = 0.0
 
-    out["forced_exits_total"] = int(forced_exits_total)
-    out["forced_eof_total"] = int(forced_eof_total)
-    out["eof_exits_total"] = int(eof_exits_total)
-    out["non_forced_exits_total"] = int(len(trades) - forced_exits_total)
-
-    # -------------------------
-    # R-space metrics (correct contract uses qty)
-    #   R = pnl / (risk_price * abs(qty))
-    # -------------------------
-    r_mults: list[float] = []
+    n = 0
     for t in trades:
-        pnl = _to_float_or_none(getattr(t, "pnl", None))
+        n += 1
+
+        pnl = _safe_float(getattr(t, "pnl", None), default=None)
         if pnl is None:
             continue
 
-        qty = _to_float_or_none(getattr(t, "qty", None))
-        if qty is None or abs(qty) <= 0:
+        pnl_list.append(pnl)
+        eq += pnl
+        equity.append(eq)
+
+        if pnl >= 0:
+            win_list.append(pnl)
+        else:
+            loss_list.append(pnl)
+
+        hm = _safe_float(getattr(t, "hold_minutes", None), default=None)
+        if hm is not None:
+            hold_minutes.append(hm)
+
+        er = getattr(t, "exit_reason", None)
+        if isinstance(er, str) and er:
+            exit_reason_counts[er] = exit_reason_counts.get(er, 0) + 1
+            if er in forced_reasons or er.startswith("FORCE_"):
+                forced_exits_total += 1
+                if er == "FORCE_EOF":
+                    forced_eof_total += 1
+                if er in {"EOF", "FORCE_EOF"}:
+                    eof_exits_total += 1
+            else:
+                non_forced_exits_total += 1
+        else:
+            non_forced_exits_total += 1
+
+        # --- R-space ---
+        rp = _safe_float(getattr(t, "risk_price", None), default=None)
+        if rp is None:
             continue
 
-        rp = _to_float_or_none(getattr(t, "risk_price", None))
-        if rp is None or rp <= 0:
-            entry = _to_float_or_none(getattr(t, "entry_price", None))
-            slp = _to_float_or_none(getattr(t, "sl_price", None))
-            if entry is not None and slp is not None:
-                rp = abs(entry - slp)
+        n_trades_with_risk += 1
 
-        if rp is None or rp <= 0:
+        if (not math.isfinite(rp)) or rp <= 0:
+            n_trades_bad_risk += 1
             continue
 
-        denom = float(rp) * abs(float(qty))
-        if denom <= 0:
+        if rp <= RISK_EPS:
+            n_trades_tiny_risk += 1
             continue
 
-        r_mults.append(float(pnl / denom))
+        R_raw = pnl / rp
+        if not math.isfinite(R_raw):
+            n_trades_bad_risk += 1
+            continue
 
-    if r_mults:
-        R = np.array(r_mults, dtype=float)
+        # Track max raw abs R
+        ar = abs(R_raw)
+        if R_max_abs_seen_raw is None or ar > R_max_abs_seen_raw:
+            R_max_abs_seen_raw = float(ar)
 
-        out["n_trades_with_risk"] = int(R.size)
-        out["expectancy_R"] = float(R.mean())
-        out["avg_R"] = float(R.mean())
-        out["median_R"] = float(np.median(R))
+        # Cap extremes, but count them
+        if ar > R_CAP_ABS:
+            n_trades_extreme_R += 1
+            R = float(max(-R_CAP_ABS, min(R_CAP_ABS, R_raw)))
+        else:
+            R = float(R_raw)
 
-        wins_R = R[R > 0]
-        losses_R = R[R < 0]
+        R_list.append(R)
+        if R >= 0:
+            R_win.append(R)
+        else:
+            R_loss.append(R)
 
-        out["winrate_R"] = float((R > 0).mean())
-        out["avg_win_R"] = float(wins_R.mean()) if wins_R.size else 0.0
-        out["avg_loss_R"] = float(losses_R.mean()) if losses_R.size else 0.0
-        out["payoff_ratio_R"] = (
-            float(out["avg_win_R"] / abs(out["avg_loss_R"])) if abs(out["avg_loss_R"]) > 1e-12 else None
-        )
+    n_trades = len(pnl_list)
+    total_pnl = float(sum(pnl_list)) if pnl_list else 0.0
+    avg_pnl = (total_pnl / n_trades) if n_trades > 0 else None
 
-        out["max_consecutive_losses_R"] = _calc_max_consecutive_losses(R)
+    winrate = (len(win_list) / n_trades) if n_trades > 0 else None
+    avg_win = (sum(win_list) / len(win_list)) if win_list else None
+    avg_loss = (sum(loss_list) / len(loss_list)) if loss_list else None
 
-        # Option A: R-space drawdown in absolute R only (DD% in R-space is not meaningful/stable)
-        eq_R = np.cumsum(R)
-        dd_R_abs, _dd_R_pct_unused = _calc_drawdown(eq_R)
-        out["max_drawdown_R_abs"] = float(dd_R_abs)
-        out["max_drawdown_R_pct"] = None
-    else:
-        out["n_trades_with_risk"] = 0
-        out["expectancy_R"] = None
-        out["avg_R"] = None
-        out["median_R"] = None
-        out["winrate_R"] = None
-        out["avg_win_R"] = None
-        out["avg_loss_R"] = None
-        out["payoff_ratio_R"] = None
-        out["max_consecutive_losses_R"] = None
-        out["max_drawdown_R_abs"] = None
-        out["max_drawdown_R_pct"] = None
+    # Profit factor in pnl-space
+    gross_win = float(sum(win_list)) if win_list else 0.0
+    gross_loss_abs = float(abs(sum(loss_list))) if loss_list else 0.0
+    profit_factor = (gross_win / gross_loss_abs) if gross_loss_abs > 0 else (float("inf") if gross_win > 0 else None)
+
+    # Drawdowns
+    max_dd_abs = _max_drawdown_abs(equity)
+    max_dd_pct = _max_drawdown_pct(equity)
+
+    # Consecutive losses in pnl-space
+    max_consec_losses = 0
+    cur = 0
+    for p in pnl_list:
+        if p < 0:
+            cur += 1
+            if cur > max_consec_losses:
+                max_consec_losses = cur
+        else:
+            cur = 0
+
+    # Hold stats
+    hold_sorted = sorted(hold_minutes) if hold_minutes else []
+    avg_hold = (sum(hold_sorted) / len(hold_sorted)) if hold_sorted else None
+    med_hold = _quantile(hold_sorted, 0.5)
+    min_hold = float(hold_sorted[0]) if hold_sorted else None
+    max_hold = float(hold_sorted[-1]) if hold_sorted else None
+
+    # R metrics
+    R_sorted = sorted(R_list) if R_list else []
+    expectancy_R = (sum(R_list) / len(R_list)) if R_list else None
+    avg_R = expectancy_R
+    median_R = _quantile(R_sorted, 0.5)
+
+    winrate_R = (len(R_win) / len(R_list)) if R_list else None
+    avg_win_R = (sum(R_win) / len(R_win)) if R_win else None
+    avg_loss_R = (sum(R_loss) / len(R_loss)) if R_loss else None
+
+    payoff_ratio_R = None
+    if avg_win_R is not None and avg_loss_R is not None and avg_loss_R != 0:
+        payoff_ratio_R = float(abs(avg_win_R / avg_loss_R))
+
+    # PF in R-space (using capped R list)
+    gross_win_R = float(sum([r for r in R_list if r > 0])) if R_list else 0.0
+    gross_loss_R_abs = float(abs(sum([r for r in R_list if r < 0]))) if R_list else 0.0
+    profit_factor_R = (gross_win_R / gross_loss_R_abs) if gross_loss_R_abs > 0 else (float("inf") if gross_win_R > 0 else None)
+
+    # Consecutive losses in R-space (capped)
+    max_consec_losses_R = 0
+    curR = 0
+    for r in R_list:
+        if r < 0:
+            curR += 1
+            if curR > max_consec_losses_R:
+                max_consec_losses_R = curR
+        else:
+            curR = 0
+
+    out: Dict[str, Any] = {
+        # Core
+        "n_trades": n_trades,
+        "total_pnl": total_pnl,
+        "winrate": winrate,
+        "avg_pnl": avg_pnl,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "profit_factor": profit_factor,
+        "max_drawdown_abs": max_dd_abs,
+        "max_drawdown_pct": max_dd_pct,
+        "max_consecutive_losses": int(max_consec_losses),
+
+        # Holds
+        "avg_hold_minutes": avg_hold,
+        "median_hold_minutes": med_hold,
+        "min_hold_minutes": min_hold,
+        "max_hold_minutes": max_hold,
+
+        # Exit reasons (top-level flattened by caller if needed)
+        "forced_exits_total": int(forced_exits_total),
+        "forced_eof_total": int(forced_eof_total),
+        "eof_exits_total": int(eof_exits_total),
+        "non_forced_exits_total": int(non_forced_exits_total),
+
+        # R-space (safe)
+        "n_trades_with_risk": int(n_trades_with_risk),
+        "n_trades_bad_risk": int(n_trades_bad_risk),
+        "n_trades_tiny_risk": int(n_trades_tiny_risk),
+        "n_trades_extreme_R": int(n_trades_extreme_R),
+        "R_cap_abs": float(R_CAP_ABS),
+        "R_max_abs_seen_raw": R_max_abs_seen_raw,
+
+        "expectancy_R": expectancy_R,
+        "avg_R": avg_R,
+        "median_R": median_R,
+        "winrate_R": winrate_R,
+        "avg_win_R": avg_win_R,
+        "avg_loss_R": avg_loss_R,
+        "payoff_ratio_R": payoff_ratio_R,
+        "profit_factor_R": profit_factor_R,
+        "max_consecutive_losses_R": int(max_consec_losses_R),
+    }
+
+    # Exit reason counts (flatten to stable keys)
+    for k, v in sorted(exit_reason_counts.items()):
+        out[f"exit_reason_count__{k}"] = int(v)
 
     return out
 
 
-def trades_to_dicts(trades: List[Trade]) -> List[Dict[str, Any]]:
+def trades_to_dicts(trades: Iterable[Any]) -> List[Dict[str, Any]]:
     """
-    Export trades as dicts for CSV output.
+    Convert trades to dicts for CSV persistence.
 
-    Contract:
-      - risk_price is persisted in Trade when possible.
-      - If missing (older runs), compute as abs(entry_price - sl_price) when available.
+    We persist *risk_price* and a best-effort 'R' column (raw if valid, else None).
     """
-    out: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
     for t in trades:
-        d = asdict(t)
+        d: Dict[str, Any] = {}
 
-        rp = _to_float_or_none(d.get("risk_price"))
-        if rp is None or rp <= 0:
-            entry = _to_float_or_none(d.get("entry_price"))
-            sl = _to_float_or_none(d.get("sl_price"))
-            d["risk_price"] = abs(entry - sl) if (entry is not None and sl is not None) else None
+        # times
+        d["entry_time"] = getattr(t, "entry_time", None)
+        d["exit_time"] = getattr(t, "exit_time", None)
 
-        out.append(d)
+        # indices (if present)
+        d["entry_idx"] = getattr(t, "entry_idx", None)
+        d["exit_idx"] = getattr(t, "exit_idx", None)
 
-    return out
+        # prices
+        d["entry_price"] = getattr(t, "entry_price", None)
+        d["exit_price"] = getattr(t, "exit_price", None)
+        d["sl_price"] = getattr(t, "sl_price", None)
+        d["tp_price"] = getattr(t, "tp_price", None)
+
+        # pnl + meta
+        pnl = _safe_float(getattr(t, "pnl", None), default=None)
+        d["pnl"] = pnl
+        d["hold_minutes"] = getattr(t, "hold_minutes", None)
+        d["exit_reason"] = getattr(t, "exit_reason", None)
+
+        # risk
+        rp = _safe_float(getattr(t, "risk_price", None), default=None)
+        d["risk_price"] = rp
+
+        # best-effort R (raw), but only if rp is valid
+        if pnl is not None and rp is not None and math.isfinite(rp) and rp > RISK_EPS:
+            R_raw = pnl / rp
+            d["R"] = float(R_raw) if math.isfinite(R_raw) else None
+        else:
+            d["R"] = None
+
+        rows.append(d)
+
+    return rows

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -21,6 +21,10 @@ class Trade:
     pnl: float
     tag: str
     exit_reason: str
+
+    # Bar indices (critical for research: duration in TRUE bars, not time gaps)
+    entry_idx: int | None = None
+    exit_idx: int | None = None
 
     # Persist SL/TP used for this trade (if available) so research metrics can compute R
     sl_price: float | None = None
@@ -46,6 +50,11 @@ class SimpleBarEngine:
     max_holding_bars semantics:
       - 0 / None => DISABLED
       - >0       => ENABLED (force exit at close when holding_bars >= max_holding_bars)
+
+    eof_buffer_bars semantics:
+      - 0 => DISABLED
+      - >0 => block new entries if remaining_bars_to_eof <= eof_buffer_bars
+              (prevents EOF artifacts under strict_no_eof)
     """
 
     def __init__(self, *, costs: Dict[str, Any], exec_cfg: Dict[str, Any], risk_cfg: Optional[Dict[str, Any]] = None):
@@ -73,6 +82,33 @@ class SimpleBarEngine:
             _mhb_int = 0
         self.max_holding_bars: Optional[int] = _mhb_int if (_mhb_int > 0) else None
         risk_cfg_norm["max_holding_bars"] = int(self.max_holding_bars) if self.max_holding_bars is not None else 0
+
+        # eof_buffer_bars normalization: 0/None => disabled
+        _ebb = risk_cfg_norm.get("eof_buffer_bars", 0)
+        try:
+            _ebb_int = int(_ebb) if _ebb is not None else 0
+        except Exception:
+            _ebb_int = 0
+        if _ebb_int < 0:
+            _ebb_int = 0
+        self.eof_buffer_bars: int = _ebb_int
+        risk_cfg_norm["eof_buffer_bars"] = int(self.eof_buffer_bars)
+
+        # optional: block entries on last bar (still useful, but weaker than eof_buffer_bars)
+        self.no_entry_on_last_bar: bool = bool(risk_cfg_norm.get("no_entry_on_last_bar", False))
+        risk_cfg_norm["no_entry_on_last_bar"] = bool(self.no_entry_on_last_bar)
+
+        # ---- NEW: minimum allowed risk at fill time (price units) ----
+        # Example EURUSD: 2 pips => 0.0002
+        _mrp = risk_cfg_norm.get("min_risk_price", 0.0)
+        try:
+            _mrp_f = float(_mrp) if _mrp is not None else 0.0
+        except Exception:
+            _mrp_f = 0.0
+        if _mrp_f < 0:
+            _mrp_f = 0.0
+        self.min_risk_price: float = _mrp_f
+        risk_cfg_norm["min_risk_price"] = float(self.min_risk_price)
 
         # v1 daily risk gates
         self.max_daily_loss_R: Optional[float] = (
@@ -168,6 +204,31 @@ class SimpleBarEngine:
     def _bump(d: Dict[str, int], key: str, n: int = 1) -> None:
         d[key] = int(d.get(key, 0)) + int(n)
 
+    def _validate_sl_relation(self, *, side: str, entry_price: float, sl_price: Optional[float]) -> Tuple[bool, str]:
+        """Return (ok, reason). For research-grade R, SL must exist and be on the correct side."""
+        if sl_price is None:
+            return False, "MISSING_SL"
+        sl = float(sl_price)
+        ep = float(entry_price)
+        if side == "BUY":
+            if not (sl < ep):
+                return False, "INVALID_SL_RELATION"
+        else:  # SELL
+            if not (sl > ep):
+                return False, "INVALID_SL_RELATION"
+        return True, "OK"
+
+    def _validate_min_risk(self, *, entry_price: float, sl_price: Optional[float]) -> Tuple[bool, str, float]:
+        """Return (ok, reason, risk_price). Enforces min_risk_price when configured."""
+        if sl_price is None:
+            return False, "MISSING_SL", 0.0
+        rp = abs(float(entry_price) - float(sl_price))
+        if rp <= 0:
+            return False, "ZERO_RISK", float(rp)
+        if self.min_risk_price > 0 and rp < float(self.min_risk_price):
+            return False, "TINY_RISK", float(rp)
+        return True, "OK", float(rp)
+
     def _close_position(
         self,
         *,
@@ -182,6 +243,8 @@ class SimpleBarEngine:
         sl_price: Optional[float],
         tp_price: Optional[float],
         risk_price: Optional[float],
+        entry_idx: Optional[int],
+        exit_idx: Optional[int],
     ) -> Trade:
         exit_fill = self._fill_exit(float(exit_level), pos_side)
         if pos_side == "BUY":
@@ -201,6 +264,8 @@ class SimpleBarEngine:
             pnl=float(pnl),
             tag=tag,
             exit_reason=exit_reason,
+            entry_idx=int(entry_idx) if entry_idx is not None else None,
+            exit_idx=int(exit_idx) if exit_idx is not None else None,
             sl_price=sl_price,
             tp_price=tp_price,
             risk_price=risk_price,
@@ -247,12 +312,19 @@ class SimpleBarEngine:
         dropped_entries_total: int = 0
         dropped_entries_by_reason: Dict[str, int] = {}
 
+        # NEW: entry skip counters for fill-time validation
+        entry_skipped_invalid_sl_relation: int = 0
+        entry_skipped_missing_sl: int = 0
+        entry_skipped_tiny_risk: int = 0
+
         time_in_position_bars: int = 0
 
         last_bar_ts: Optional[pd.Timestamp] = None
         last_bar_close: Optional[float] = None
 
         open_position_at_eof: bool = False  # ARCH A audit
+
+        n_bars = int(len(df) or 0)
 
         for i, (ts, row) in enumerate(df.iterrows()):
             last_bar_ts = ts
@@ -272,23 +344,55 @@ class SimpleBarEngine:
 
             # Fill pending entry at this bar open
             if pos_side is None and pending_intent is not None:
-                pos_side = pending_intent.side
-                pos_qty = float(pending_intent.qty)
-                entry_price = self._fill_entry(o, pos_side)
-                entry_time = ts
-                entry_index = i
+                side = pending_intent.side
+                qty = float(pending_intent.qty)
 
-                sl = float(pending_intent.sl_price) if pending_intent.sl_price is not None else None
-                tp = float(pending_intent.tp_price) if pending_intent.tp_price is not None else None
-                pos_sl_price = sl
-                pos_tp_price = tp
-                pos_risk_price = abs(float(entry_price) - float(sl)) if (sl is not None) else None
+                filled_entry = self._fill_entry(o, side)
 
-                tag = pending_tag
-                pending_intent = None
-                pending_tag = ""
+                _sl = float(pending_intent.sl_price) if pending_intent.sl_price is not None else None
+                _tp = float(pending_intent.tp_price) if pending_intent.tp_price is not None else None
 
-                entries_today += 1
+                ok_sl, reason_sl = self._validate_sl_relation(side=side, entry_price=filled_entry, sl_price=_sl)
+                if not ok_sl:
+                    if reason_sl == "MISSING_SL":
+                        entry_skipped_missing_sl += 1
+                        self._bump(dropped_entries_by_reason, "ENTRY_SKIPPED_MISSING_SL")
+                    else:
+                        entry_skipped_invalid_sl_relation += 1
+                        self._bump(dropped_entries_by_reason, "ENTRY_SKIPPED_INVALID_SL_RELATION")
+                    dropped_entries_total += 1
+                    pending_intent = None
+                    pending_tag = ""
+                else:
+                    ok_risk, reason_risk, rp = self._validate_min_risk(entry_price=filled_entry, sl_price=_sl)
+                    if not ok_risk:
+                        if reason_risk in ("MISSING_SL",):
+                            entry_skipped_missing_sl += 1
+                            self._bump(dropped_entries_by_reason, "ENTRY_SKIPPED_MISSING_SL")
+                        else:
+                            entry_skipped_tiny_risk += 1
+                            self._bump(dropped_entries_by_reason, f"ENTRY_SKIPPED_{reason_risk}")
+                        dropped_entries_total += 1
+                        pending_intent = None
+                        pending_tag = ""
+                    else:
+                        # commit position
+                        pos_side = side
+                        pos_qty = qty
+                        entry_price = float(filled_entry)
+                        entry_time = ts
+                        entry_index = i
+
+                        sl = _sl
+                        tp = _tp
+                        pos_sl_price = sl
+                        pos_tp_price = tp
+                        pos_risk_price = float(rp)
+
+                        tag = pending_tag
+                        pending_intent = None
+                        pending_tag = ""
+                        entries_today += 1
 
             if pos_side is not None:
                 time_in_position_bars += 1
@@ -348,6 +452,8 @@ class SimpleBarEngine:
                         sl_price=pos_sl_price,
                         tp_price=pos_tp_price,
                         risk_price=pos_risk_price,
+                        entry_idx=int(entry_index),
+                        exit_idx=int(i),
                     )
                     trades.append(trade)
 
@@ -399,32 +505,52 @@ class SimpleBarEngine:
                         blocked = True
                         blocked_reason = "COOLDOWN"
 
+                    # ---- Guardrails v2 + EOF buffer gating ----
                     if not blocked:
                         active_positions = 0  # flat by construction
-                        if self.fill_mode == "next_open":
-                            if i < len(df) - 1:
-                                entry_ts = df.index[i + 1]
+
+                        # Compute remaining bars to EOF at the *fill bar*
+                        fill_index = i + 1 if self.fill_mode == "next_open" else i
+                        remaining_bars = (n_bars - 1) - int(fill_index)
+
+                        # Optional legacy: no entry on last bar
+                        if self.no_entry_on_last_bar and fill_index >= (n_bars - 1):
+                            blocked = True
+                            blocked_reason = "V2_by_eof_buffer"
+                            self._bump(blocked_v2_by_reason, "by_eof_buffer")
+
+                        # Strong rule: EOF buffer
+                        if (not blocked) and (self.eof_buffer_bars > 0) and (remaining_bars <= self.eof_buffer_bars):
+                            blocked = True
+                            blocked_reason = "V2_by_eof_buffer"
+                            self._bump(blocked_v2_by_reason, "by_eof_buffer")
+
+                        # Standard guardrails checks
+                        if not blocked:
+                            if self.fill_mode == "next_open":
+                                if i < n_bars - 1:
+                                    entry_ts = df.index[i + 1]
+                                    ok, reason = self.guardrails.allow_entry(
+                                        bar_time_utc=pd.Timestamp(entry_ts),
+                                        active_positions=active_positions,
+                                    )
+                                    if not ok:
+                                        blocked = True
+                                        blocked_reason = f"V2_{str(reason) if reason else 'GUARDRAILS'}"
+                                        self._bump(blocked_v2_by_reason, str(reason) if reason else "UNKNOWN")
+                                else:
+                                    dropped_entries_total += 1
+                                    self._bump(dropped_entries_by_reason, "NO_NEXT_OPEN")
+                                    continue
+                            else:
                                 ok, reason = self.guardrails.allow_entry(
-                                    bar_time_utc=pd.Timestamp(entry_ts),
+                                    bar_time_utc=pd.Timestamp(ts),
                                     active_positions=active_positions,
                                 )
                                 if not ok:
                                     blocked = True
                                     blocked_reason = f"V2_{str(reason) if reason else 'GUARDRAILS'}"
                                     self._bump(blocked_v2_by_reason, str(reason) if reason else "UNKNOWN")
-                            else:
-                                dropped_entries_total += 1
-                                self._bump(dropped_entries_by_reason, "NO_NEXT_OPEN")
-                                continue
-                        else:
-                            ok, reason = self.guardrails.allow_entry(
-                                bar_time_utc=pd.Timestamp(ts),
-                                active_positions=active_positions,
-                            )
-                            if not ok:
-                                blocked = True
-                                blocked_reason = f"V2_{str(reason) if reason else 'GUARDRAILS'}"
-                                self._bump(blocked_v2_by_reason, str(reason) if reason else "UNKNOWN")
 
                     if blocked:
                         blocked_total += 1
@@ -434,24 +560,54 @@ class SimpleBarEngine:
 
                     # Proceed with entry
                     if self.fill_mode == "next_open":
-                        if i < len(df) - 1:
+                        if i < n_bars - 1:
                             pending_intent = intent
                             pending_tag = intent.tag
                         else:
                             dropped_entries_total += 1
                             self._bump(dropped_entries_by_reason, "NO_NEXT_OPEN")
                     else:
-                        pos_side = intent.side
-                        pos_qty = float(intent.qty)
-                        entry_price = self._fill_entry(c, pos_side)
+                        # Immediate fill at close
+                        side = intent.side
+                        qty = float(intent.qty)
+                        filled_entry = self._fill_entry(c, side)
+
+                        _sl = float(intent.sl_price) if intent.sl_price is not None else None
+                        _tp = float(intent.tp_price) if intent.tp_price is not None else None
+
+                        ok_sl, reason_sl = self._validate_sl_relation(side=side, entry_price=filled_entry, sl_price=_sl)
+                        if not ok_sl:
+                            dropped_entries_total += 1
+                            if reason_sl == "MISSING_SL":
+                                entry_skipped_missing_sl += 1
+                                self._bump(dropped_entries_by_reason, "ENTRY_SKIPPED_MISSING_SL")
+                            else:
+                                entry_skipped_invalid_sl_relation += 1
+                                self._bump(dropped_entries_by_reason, "ENTRY_SKIPPED_INVALID_SL_RELATION")
+                            continue
+
+                        ok_risk, reason_risk, rp = self._validate_min_risk(entry_price=filled_entry, sl_price=_sl)
+                        if not ok_risk:
+                            dropped_entries_total += 1
+                            if reason_risk == "MISSING_SL":
+                                entry_skipped_missing_sl += 1
+                                self._bump(dropped_entries_by_reason, "ENTRY_SKIPPED_MISSING_SL")
+                            else:
+                                entry_skipped_tiny_risk += 1
+                                self._bump(dropped_entries_by_reason, f"ENTRY_SKIPPED_{reason_risk}")
+                            continue
+
+                        pos_side = side
+                        pos_qty = qty
+                        entry_price = float(filled_entry)
                         entry_time = ts
                         entry_index = i
 
-                        sl = float(intent.sl_price) if intent.sl_price is not None else None
-                        tp = float(intent.tp_price) if intent.tp_price is not None else None
+                        sl = _sl
+                        tp = _tp
                         pos_sl_price = sl
                         pos_tp_price = tp
-                        pos_risk_price = abs(float(entry_price) - float(sl)) if (sl is not None) else None
+                        pos_risk_price = float(rp)
 
                         tag = intent.tag
                         entries_today += 1
@@ -463,6 +619,7 @@ class SimpleBarEngine:
 
         # EOF: open position handling (ARCH A/B)
         if (pos_side is not None) and (entry_time is not None) and (last_bar_ts is not None) and (last_bar_close is not None):
+            eof_idx = n_bars - 1 if n_bars > 0 else None
             if self.force_exit_on_eof:
                 trade = self._close_position(
                     ts=last_bar_ts,
@@ -476,6 +633,8 @@ class SimpleBarEngine:
                     sl_price=pos_sl_price,
                     tp_price=pos_tp_price,
                     risk_price=pos_risk_price,
+                    entry_idx=int(entry_index) if entry_index is not None else None,
+                    exit_idx=int(eof_idx) if eof_idx is not None else None,
                 )
                 trades.append(trade)
                 self._bump(forced_exits, "EOF")
@@ -487,7 +646,7 @@ class SimpleBarEngine:
                 open_position_at_eof = True
                 self._bump(forced_exits, "EOF_SKIPPED_BY_POLICY")
 
-            # Reset internal state (keep object consistent)
+            # Reset internal state
             pos_side = None
             pending_intent = None
 
@@ -516,6 +675,9 @@ class SimpleBarEngine:
                 "cooldown_bars": self.cooldown_bars,
                 "force_exit_on_eof": bool(self.force_exit_on_eof),
                 "max_holding_bars": int(self.max_holding_bars) if self.max_holding_bars is not None else 0,
+                "eof_buffer_bars": int(self.eof_buffer_bars),
+                "no_entry_on_last_bar": bool(self.no_entry_on_last_bar),
+                "min_risk_price": float(self.min_risk_price),
             },
             "final_day_key_utc": current_day,
             "final_entries_today": entries_today,
@@ -533,6 +695,9 @@ class SimpleBarEngine:
                 "blocked_total": blocked_total,
                 "blocked_unique_bars": len(blocked_unique_bars),
                 "blocked_by_reason": dict(blocked_by_reason),
+                "entry_skipped_invalid_sl_relation": int(entry_skipped_invalid_sl_relation),
+                "entry_skipped_missing_sl": int(entry_skipped_missing_sl),
+                "entry_skipped_tiny_risk": int(entry_skipped_tiny_risk),
             },
 
             "guardrails": gr_rep,

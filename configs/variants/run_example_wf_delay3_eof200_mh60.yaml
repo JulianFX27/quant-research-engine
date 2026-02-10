@@ -1,0 +1,40 @@
+costs:
+  commission: 0.0
+  slippage_pips: 0.0
+  spread_pips: 1.0
+data_path: data/raw/eurusd_m5_2022-01-03__2024-12-31.csv
+dataset_registry:
+  allow_override: false
+  override_reason: ''
+  registry_dir: data/registry
+execution:
+  entry_delay: 0
+  entry_delay_bars: 3
+  policy_id: baseline
+instrument:
+  data_source: csv_example
+  pip_size: 0.0001
+name: example_run_wf
+risk:
+  cooldown_bars: 0
+  eof_buffer_bars: 200
+  force_exit_on_eof: true
+  max_concurrent_positions: 1
+  max_daily_loss_R: 999.0
+  max_holding_bars: 60
+  max_trades_per_day: 999999
+  min_risk_price: 0.0002
+  no_entry_on_last_bar: true
+  time_window_enabled: false
+  window_end_utc: '23:59'
+  window_start_utc: 00:00
+strategy:
+  name: ExampleMomentum
+  params:
+    qty: 1.0
+    sl_pips: 10
+    sma_n: 20
+    tp_pips: 20
+    warmup_bars: 50
+symbol: EURUSD
+timeframe: M5

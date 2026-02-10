@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 import hashlib
 import json
 
@@ -190,15 +190,67 @@ def _canonical_bytes(
     return out.tobytes(order="C"), rows, start_iso, end_iso
 
 
+def _to_ymd(ts: Any) -> str:
+    """
+    Normalize a timestamp-ish value into 'YYYY-MM-DD'.
+
+    Accepts:
+      - ISO strings (with or without timezone)
+      - datetime-like / pandas Timestamp
+      - already 'YYYY-MM-DD'
+
+    If parsing fails, best-effort fallback:
+      - split by 'T' or space and keep first token
+    """
+    if ts is None:
+        return "unknown"
+
+    # Fast-path: already YYYY-MM-DD
+    try:
+        s0 = str(ts).strip()
+        if len(s0) == 10 and s0[4] == "-" and s0[7] == "-":
+            return s0
+    except Exception:
+        pass
+
+    # Robust parse (tz-aware safe)
+    try:
+        t = pd.to_datetime(ts, utc=True, errors="raise")
+        return t.strftime("%Y-%m-%d")
+    except Exception:
+        s = str(ts).strip()
+        if "T" in s:
+            return s.split("T", 1)[0]
+        if " " in s:
+            return s.split(" ", 1)[0]
+        return s or "unknown"
+
+
 def build_dataset_id(
     instrument: str,
     timeframe: str,
-    start_ts: str,
-    end_ts: str,
+    start_ts: Any,
+    end_ts: Any,
     source: Optional[str] = None,
 ) -> str:
-    base = f"{instrument}_{timeframe}_{start_ts[:10]}__{end_ts[:10]}"
-    return f"{base}__{source}" if source else base
+    """
+    Stable dataset_id:
+
+      <INSTRUMENT>_<TIMEFRAME>_<YYYY-MM-DD>__<YYYY-MM-DD>__[<source>]
+
+    Examples:
+      EURUSD_M5_2026-01-01__2026-01-02__csv_example
+    """
+    inst = str(instrument or "UNKNOWN").strip().upper()
+    tf = str(timeframe or "UNKNOWN").strip().replace(" ", "").upper()
+    s = _to_ymd(start_ts)
+    e = _to_ymd(end_ts)
+
+    base = f"{inst}_{tf}_{s}__{e}"
+    if source is None:
+        return base
+    src = str(source).strip()
+    return f"{base}__{src}" if src else base
 
 
 def build_dataset_metadata(

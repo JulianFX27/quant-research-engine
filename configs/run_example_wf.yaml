@@ -1,0 +1,52 @@
+name: example_run_wf
+symbol: EURUSD
+timeframe: M5
+data_path: data/raw/eurusd_m5_2022-01-03__2024-12-31.csv
+
+instrument:
+  pip_size: 0.0001
+  data_source: csv_example
+
+dataset_registry:
+  registry_dir: data/registry
+  allow_override: false
+  override_reason: ""
+
+strategy:
+  name: ExampleMomentum
+  params:
+    sma_n: 20
+    qty: 1.0
+    warmup_bars: 50
+    sl_pips: 10
+    tp_pips: 20
+
+execution:
+  policy_id: baseline
+
+costs:
+  commission: 0.0
+  spread_pips: 1.0
+  slippage_pips: 0.0
+
+risk:
+  max_daily_loss_R: 999.0
+  max_trades_per_day: 999999
+  cooldown_bars: 0
+
+  max_concurrent_positions: 1
+  time_window_enabled: false
+  window_start_utc: "00:00"
+  window_end_utc: "23:59"
+
+  # Subimos el cap para permitir que TP/SL ocurran antes del forced exit
+  max_holding_bars: 120
+
+  # Bloquea nuevas entradas si faltan <= N barras para EOF (evita EOF trades)
+  eof_buffer_bars: 50
+
+  # Opcional
+  no_entry_on_last_bar: true
+
+  # Mantener true está bien; en strict_no_eof igual evitamos llegar a EOF con posición abierta
+  force_exit_on_eof: true
