@@ -1,1 +1,83 @@
-policies/execution_policies.yaml
+# configs/execution_policies.yaml
+# Execution Policies (overlay-only)
+#
+# Each top-level key is a policy_id referenced by run configs:
+#   execution:
+#     policy_id: baseline
+#
+# Policies may override ONLY these sections:
+#   - execution
+#   - costs
+#   - risk
+
+baseline:
+  execution:
+    fill_mode: next_open
+    intrabar_path: OHLC
+    intrabar_tie: sl_first
+
+# ---------------------------
+# Execution-only variations
+# ---------------------------
+market_close_fill:
+  execution:
+    fill_mode: close
+
+olhc_path:
+  execution:
+    intrabar_path: OLHC
+
+tp_first_tie:
+  execution:
+    intrabar_tie: tp_first
+
+# ---------------------------
+# Costs variations
+# ---------------------------
+wider_costs_2pips:
+  costs:
+    spread_pips: 2.0
+    slippage_pips: 0.0
+    commission: 0.0
+
+# ---------------------------
+# Risk / guardrails variations
+# ---------------------------
+conservative_risk:
+  risk:
+    max_daily_loss_R: 1.0
+    max_trades_per_day: 1
+    cooldown_bars: 5
+    max_concurrent_positions: 1
+    time_window_enabled: false
+    window_start_utc: "13:30"
+    window_end_utc: "16:00"
+    max_holding_bars: 0
+
+# Research policy: remove v1 gating so we can observe raw strategy behavior.
+# null => unlimited/disabled (supported by config validator + engine checks)
+research_unbounded:
+  risk:
+    max_daily_loss_R: null
+    max_trades_per_day: null
+    cooldown_bars: 0
+    # keep v2 explicit and deterministic
+    max_concurrent_positions: 1
+    time_window_enabled: false
+    window_start_utc: "13:30"
+    window_end_utc: "16:00"
+    max_holding_bars: 0
+
+# Optional: "signals only" by blocking all entries (useful for sanity checks)
+# NOTE: requires validator to allow 0 if you want max_trades_per_day=0; we do NOT.
+# So we use time window impossible instead (blocks at v2 gate if enabled).
+research_signals_only:
+  risk:
+    max_daily_loss_R: null
+    max_trades_per_day: null
+    cooldown_bars: 0
+    max_concurrent_positions: 1
+    time_window_enabled: true
+    window_start_utc: "00:00"
+    window_end_utc: "00:00"
+    max_holding_bars: 0
