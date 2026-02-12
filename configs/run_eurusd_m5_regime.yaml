@@ -1,0 +1,58 @@
+name: "EURUSD_M5__AnchorReversionFX__regime_fx"
+symbol: "EURUSD"
+timeframe: "M5"
+data_path: "data/raw/eurusd_m5_2022-01-03__2024-12-31.csv"
+
+instrument:
+  pip_size: 0.0001
+  data_source: "csv"
+
+dataset_registry:
+  registry_dir: "data/registry"
+  allow_override: false
+  append_match_event: true
+
+# Needed by AnchorReversionFX
+shock_z:
+  enabled: true
+  close_col: "close"
+  horizon_bars: 1
+  lookback: 288
+  warmup_bars: 300
+  std_floor: 1e-9
+  clip_z: 10.0
+
+# Regime FX hook (current contract requires config_path)
+regime_fx:
+  enabled: true
+  config_path: "configs/regime_fx.yaml"
+  warmup_bars: 300
+
+strategy:
+  name: "AnchorReversionFX"
+  params: {}
+
+execution:
+  fill_mode: "next_open"
+  intrabar_path: "OHLC"
+  intrabar_tie: "tp_first"
+  entry_delay_bars: 0
+
+costs:
+  commission: 0.0
+  spread_pips: 1.0
+  slippage_pips: 0.0
+
+risk:
+  force_exit_on_eof: true
+  cooldown_bars: 0
+  max_concurrent_positions: 1
+
+dist_to_anchor:
+  enabled: true
+  close_col: "close"
+  out_col: "dist_to_anchor_pips"
+  anchor_mode: "ema"
+  anchor_lookback: 288
+  warmup_bars: 300
+  abs_value: true

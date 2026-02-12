@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import replace
+from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -12,6 +12,7 @@ from typing import Any, Dict, Tuple
 import pandas as pd
 import yaml
 
+from backtester.orchestrator.dist_to_anchor_hook import attach_dist_to_anchor_if_enabled
 from backtester.core.config import validate_run_config
 from backtester.data.dataset_fingerprint import build_dataset_id
 from backtester.data.dataset_registry import register_or_validate_dataset
@@ -20,6 +21,8 @@ from backtester.execution.engine import SimpleBarEngine
 from backtester.execution.policies import apply_execution_policy
 from backtester.metrics.basic import summarize_trades, trades_to_dicts
 from backtester.orchestrator.entry_delay import apply_entry_delay
+from backtester.orchestrator.regime_fx_hook import attach_regime_fx_if_enabled
+from backtester.orchestrator.shock_z_hook import attach_shock_z_if_enabled
 from backtester.strategies.registry import make_strategy
 
 
@@ -29,9 +32,10 @@ from backtester.strategies.registry import make_strategy
 
 def _parse_scalar(s: str) -> Any:
     """
-    Parse a scalar string to bool/int/float/None/str.
+    Parse a scalar string to bool/int/float/None/str, with JSON list/dict support.
 
     Rules:
+      - JSON: if raw is a JSON list/dict literal (starts with '[' or '{'), try json.loads(raw)
       - true/false/yes/no/y/n (case-insensitive) -> bool
       - null/none/~ -> None
       - int-like -> int
@@ -49,6 +53,15 @@ def _parse_scalar(s: str) -> Any:
     if raw == "":
         return ""
 
+    # JSON container support: sessions=[], params={"a":1}, etc.
+    # Only attempt if it looks like a JSON container; otherwise keep scalar rules.
+    if raw.startswith("[") or raw.startswith("{"):
+        try:
+            return json.loads(raw)
+        except Exception:
+            # Fall back to scalar parsing
+            pass
+
     low = raw.lower()
     if low in ("true", "yes", "y"):
         return True
@@ -57,14 +70,14 @@ def _parse_scalar(s: str) -> Any:
     if low in ("null", "none", "~"):
         return None
 
-    # int?
+    # int
     try:
         if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
             return int(raw)
     except Exception:
         pass
 
-    # float?
+    # float
     try:
         v = float(raw)
         if math.isfinite(v):
@@ -76,7 +89,6 @@ def _parse_scalar(s: str) -> Any:
 
 
 def _parse_set_kv(item: str) -> Tuple[str, Any]:
-    """Parse 'a.b.c=value' into ('a.b.c', value)."""
     if not isinstance(item, str) or "=" not in item:
         raise ValueError(
             f"Invalid --set {item!r}. Expected format: --set key=value (e.g., --set risk.force_exit_on_eof=false)"
@@ -89,10 +101,6 @@ def _parse_set_kv(item: str) -> Tuple[str, Any]:
 
 
 def _set_deep(cfg: Dict[str, Any], dotted_key: str, value: Any) -> None:
-    """
-    Set cfg['a']['b']['c']=value given dotted_key='a.b.c'.
-    Creates intermediate dicts if needed.
-    """
     if not isinstance(cfg, dict):
         raise ValueError("Config root must be a dict to apply --set overrides.")
 
@@ -114,7 +122,6 @@ def _set_deep(cfg: Dict[str, Any], dotted_key: str, value: Any) -> None:
 
 
 def _apply_cli_overrides(cfg: Dict[str, Any], set_items: list[str] | None) -> Dict[str, Any]:
-    """Apply --set overrides in order. Returns dict of applied overrides."""
     applied: Dict[str, Any] = {}
     if not set_items:
         return applied
@@ -128,11 +135,52 @@ def _apply_cli_overrides(cfg: Dict[str, Any], set_items: list[str] | None) -> Di
 
 
 # ----------------------------
-# Existing helpers
+# Helpers
 # ----------------------------
 
+def _json_safe(obj: Any) -> Any:
+    """
+    Make an object JSON-serializable deterministically.
+    - Handles dataclasses (OrderIntent), pandas/numpy scalars, Path, sets, etc.
+    """
+    # dataclass (OrderIntent, reports, etc.)
+    if is_dataclass(obj):
+        try:
+            return _json_safe(asdict(obj))
+        except Exception:
+            return str(obj)
+
+    # pandas / numpy scalars
+    try:
+        if isinstance(obj, (pd.Timestamp,)):
+            return obj.isoformat()
+    except Exception:
+        pass
+
+    # basic scalars
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (str, int, bool)) or obj is None:
+        return obj
+
+    # containers
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, set):
+        return sorted([_json_safe(v) for v in obj], key=lambda x: str(x))
+
+    # Paths
+    if isinstance(obj, Path):
+        return str(obj)
+
+    # fallback
+    return str(obj)
+
+
 def _sanitize_for_json(obj: Any) -> Any:
-    """Avoid NaN/Infinity in JSON outputs."""
+    # kept for metrics; safe enough, but you can swap to _json_safe if you want
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
     if isinstance(obj, dict):
@@ -143,11 +191,6 @@ def _sanitize_for_json(obj: Any) -> Any:
 
 
 def _build_equity_curve(df: pd.DataFrame, trades: list[dict]) -> pd.DataFrame:
-    """
-    Minimal equity curve:
-      - step equity at each trade exit_time (cum pnl)
-      - if no trades: single flat point at first bar time (if available)
-    """
     if trades:
         tdf = pd.DataFrame(trades)
         if "exit_time" in tdf.columns and "pnl" in tdf.columns:
@@ -165,7 +208,6 @@ def _build_equity_curve(df: pd.DataFrame, trades: list[dict]) -> pd.DataFrame:
 
 
 def _canonical_cfg_json(cfg: Dict[str, Any]) -> str:
-    """Stable JSON string for hashing (sorted keys, compact)."""
     return json.dumps(cfg, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -185,12 +227,6 @@ def _get_registry_dir(cfg: Dict[str, Any]) -> str:
 
 
 def _norm_forced_dataset_id(x: Any) -> str | None:
-    """
-    Normalize cfg.dataset_id:
-      - None/"" -> None
-      - strip spaces
-      - reject non-strings
-    """
     if x is None:
         return None
     if not isinstance(x, str):
@@ -200,7 +236,6 @@ def _norm_forced_dataset_id(x: Any) -> str | None:
 
 
 def _norm_int(x: Any) -> int | None:
-    """Best-effort normalize int-like values. Returns None if cannot parse."""
     if x is None:
         return None
     if isinstance(x, bool):
@@ -214,9 +249,6 @@ def _norm_int(x: Any) -> int | None:
 
 
 def _capture_policy_sensitive_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Capture overrides that must remain stable even if an execution policy overlay runs.
-    """
     risk = cfg.get("risk", {}) or {}
     return {
         "risk.eof_buffer_bars": _norm_int(risk.get("eof_buffer_bars", None)),
@@ -224,10 +256,6 @@ def _capture_policy_sensitive_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _apply_policy_sensitive_overrides(cfg_resolved: Dict[str, Any], overrides: Dict[str, Any]) -> None:
-    """Re-apply captured overrides onto cfg_resolved with highest precedence."""
-    if not isinstance(cfg_resolved, dict):
-        return
-
     eofb = overrides.get("risk.eof_buffer_bars", None)
     if eofb is not None:
         cfg_resolved.setdefault("risk", {})
@@ -237,7 +265,6 @@ def _apply_policy_sensitive_overrides(cfg_resolved: Dict[str, Any], overrides: D
 
 
 def _get_validity_mode(cfg: Dict[str, Any]) -> str | None:
-    """Best-effort: validity mode can live at top-level or inside risk."""
     v = cfg.get("validity_mode")
     if isinstance(v, str) and v.strip():
         return v.strip()
@@ -249,9 +276,6 @@ def _get_validity_mode(cfg: Dict[str, Any]) -> str | None:
 
 
 def _extract_max_holding_bars_from_cfg(cfg: Dict[str, Any]) -> int | None:
-    """
-    Best-effort: max_holding_bars can be declared in several places depending on wiring.
-    """
     risk = cfg.get("risk", {}) or {}
 
     g = risk.get("guardrails")
@@ -281,9 +305,6 @@ def _extract_max_holding_bars_from_cfg(cfg: Dict[str, Any]) -> int | None:
 
 
 def _enforce_strict_no_eof_entry_safety(cfg_resolved: Dict[str, Any]) -> None:
-    """
-    If validity_mode=strict_no_eof, enforce that eof_buffer_bars is at least max_holding_bars.
-    """
     mode = _get_validity_mode(cfg_resolved)
     if mode != "strict_no_eof":
         return
@@ -291,12 +312,10 @@ def _enforce_strict_no_eof_entry_safety(cfg_resolved: Dict[str, Any]) -> None:
     cfg_resolved.setdefault("risk", {})
     if not isinstance(cfg_resolved["risk"], dict):
         cfg_resolved["risk"] = {}
-
     risk = cfg_resolved["risk"]
 
     eofb = _norm_int(risk.get("eof_buffer_bars"))
     max_hold = _extract_max_holding_bars_from_cfg(cfg_resolved)
-
     if max_hold is None:
         return
 
@@ -306,31 +325,17 @@ def _enforce_strict_no_eof_entry_safety(cfg_resolved: Dict[str, Any]) -> None:
 
 
 def _ts_to_ymd(ts: Any) -> str:
-    """
-    Normalize a timestamp-ish (iso string, pandas Timestamp, datetime) to YYYY-MM-DD.
-    If parsing fails, fallback to str(ts).
-    """
     try:
         t = pd.to_datetime(ts, utc=True, errors="raise")
         return t.strftime("%Y-%m-%d")
     except Exception:
         s = str(ts)
-        # best-effort: if iso-like, take date portion
         if "T" in s:
             return s.split("T", 1)[0]
         return s
 
 
 def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, Any, str]:
-    """
-    Returns:
-      (df, dataset_meta_final, dataset_id_final)
-
-    Design:
-      - loader may require a dataset_id; we pass provisional to compute metadata
-      - then compute dataset_id_final from canonical start/end OR respect cfg.dataset_id if provided
-      - only dataset_id_final is ever registered
-    """
     instrument = cfg.get("instrument", {}) or {}
     symbol = str(cfg.get("symbol") or "UNKNOWN")
     timeframe = str(cfg.get("timeframe") or "UNKNOWN")
@@ -356,10 +361,9 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
         cfg["data_path"],
         return_fingerprint=True,
         dataset_id=dataset_id_prov,
-        keep_extra_cols=True,  # <-- CLAVE para estrategias con features
+        keep_extra_cols=True,
     )
 
-    # IMPORTANT: dataset_id should be stable and match tests: YYYY-MM-DD only
     start_ymd = _ts_to_ymd(dataset_meta.start_ts)
     end_ymd = _ts_to_ymd(dataset_meta.end_ts)
 
@@ -387,69 +391,6 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
     return df, dataset_meta_final, dataset_id_final
 
 
-def _flatten_entry_gate_into_metrics(metrics: Dict[str, Any], risk_report: Dict[str, Any]) -> None:
-    rr = risk_report or {}
-
-    eg1 = (rr.get("entry_gate") or {})
-    metrics["entry_gate_attempted_entries"] = int(eg1.get("attempted_entries", 0) or 0)
-    metrics["entry_gate_blocked_total"] = int(eg1.get("blocked_total", 0) or 0)
-    metrics["entry_gate_blocked_unique_bars"] = int(eg1.get("blocked_unique_bars", 0) or 0)
-
-    bbr1 = eg1.get("blocked_by_reason") or {}
-    if isinstance(bbr1, dict):
-        for k, v in bbr1.items():
-            metrics[f"entry_gate_blocked_by_reason__{k}"] = int(v or 0)
-
-    gr = (rr.get("guardrails") or {})
-    eg2 = (gr.get("entry_gate") or {})
-    metrics["entry_gate_v2_attempted_entries"] = int(eg2.get("attempted_entries", 0) or 0)
-    metrics["entry_gate_v2_blocked_total"] = int(eg2.get("blocked_total", 0) or 0)
-    metrics["entry_gate_v2_blocked_unique_bars"] = int(eg2.get("blocked_unique_bars", 0) or 0)
-
-    bbr2 = eg2.get("blocked_v2_by_reason") or {}
-    if isinstance(bbr2, dict):
-        for k, v in bbr2.items():
-            metrics[f"entry_gate_v2_blocked_by_reason__{k}"] = int(v or 0)
-
-
-def _flatten_fill_dropped_into_metrics(metrics: Dict[str, Any], risk_report: Dict[str, Any]) -> None:
-    rr = risk_report or {}
-    d = (rr.get("entry_fill_dropped") or {})
-    metrics["entry_fill_dropped_total"] = int(d.get("dropped_total", 0) or 0)
-
-    by_reason = d.get("dropped_by_reason") or {}
-    if isinstance(by_reason, dict):
-        for k, v in by_reason.items():
-            metrics[f"entry_fill_dropped_by_reason__{k}"] = int(v or 0)
-
-
-def _flatten_engine_util_into_metrics(metrics: Dict[str, Any], risk_report: Dict[str, Any]) -> None:
-    rr = risk_report or {}
-    e = (rr.get("engine") or {})
-    metrics["engine_bars_total"] = int(e.get("bars_total", 0) or 0)
-    metrics["engine_time_in_position_bars"] = int(e.get("time_in_position_bars", 0) or 0)
-
-    tir = e.get("time_in_position_rate")
-    try:
-        metrics["engine_time_in_position_rate"] = float(tir) if tir is not None else None
-    except Exception:
-        metrics["engine_time_in_position_rate"] = None
-
-
-def _flatten_forced_exits_into_metrics(metrics: Dict[str, Any], risk_report: Dict[str, Any]) -> None:
-    rr = risk_report or {}
-    fx = (rr.get("forced_exits") or {})
-    if isinstance(fx, dict):
-        total = 0
-        for k, v in fx.items():
-            n = int(v or 0)
-            total += n
-            metrics[f"forced_exits__{k}"] = n
-        metrics["forced_exits_total"] = int(total)
-    else:
-        metrics["forced_exits_total"] = 0
-
-
 def _flatten_entry_delay_into_metrics(metrics: Dict[str, Any], entry_delay_report: Any | None) -> None:
     if entry_delay_report is None:
         metrics["execution_entry_delay_bars"] = None
@@ -466,22 +407,10 @@ def _flatten_entry_delay_into_metrics(metrics: Dict[str, Any], entry_delay_repor
     )
 
 
-# ----------------------------
-# Validity / status policy
-# ----------------------------
-
 def _allowed_forced_exits_total(metrics: Dict[str, Any], cfg_resolved: Dict[str, Any]) -> int:
-    """
-    Allowed forced exits are those that are part of the strategy's intended lifecycle.
-
-    Current rule:
-      - If max_holding_bars > 0, then FORCE_MAX_HOLD is considered a valid (allowed) exit.
-        (It remains "forced" for auditability, but should NOT invalidate trades.)
-    """
     max_hold_cfg = _extract_max_holding_bars_from_cfg(cfg_resolved)
     if max_hold_cfg is None or int(max_hold_cfg) <= 0:
         return 0
-
     return int(metrics.get("exit_reason_count__FORCE_MAX_HOLD", 0) or 0)
 
 
@@ -515,13 +444,41 @@ def _compute_run_status(metrics: Dict[str, Any], cfg_resolved: Dict[str, Any]) -
     }
 
 
+def _intent_is_empty(intent: Any) -> bool:
+    if intent is None:
+        return True
+    if isinstance(intent, (list, tuple, dict, set)):
+        return len(intent) == 0
+    return False
+
+
+def _summarize_intents(intents_by_bar: list[Any], *, sample_max: int = 5) -> Dict[str, Any]:
+    non_null = 0
+    non_empty = 0
+    sample: list[dict] = []
+
+    for i, it in enumerate(intents_by_bar):
+        if it is not None:
+            non_null += 1
+        if not _intent_is_empty(it):
+            non_empty += 1
+            if len(sample) < sample_max:
+                sample.append({"bar_index": i, "intent": _json_safe(it)})
+
+    return {
+        "intents_total_bars": int(len(intents_by_bar)),
+        "intents_non_null_bars": int(non_null),
+        "intents_non_empty_bars": int(non_empty),
+        "intents_sample": sample,
+    }
+
+
 def run_from_config(
     cfg: Dict[str, Any],
     out_dir: str | Path,
     *,
     cli_overrides: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    # capture policy-sensitive overrides AFTER CLI overrides have been applied
     policy_overrides = _capture_policy_sensitive_overrides(cfg)
 
     pol_res = apply_execution_policy(cfg)
@@ -545,10 +502,18 @@ def run_from_config(
     # Load + dataset registry
     df, dataset_meta, dataset_id_final = _load_bars_and_register_dataset(cfg_resolved)
 
+    # ---- Optional: Distance-to-anchor feature (deterministic) ----
+    pip_size = float(instrument.get("pip_size", 0.0) or 0.0)
+    df, dist_anchor_manifest = attach_dist_to_anchor_if_enabled(df, cfg_resolved, pip_size=pip_size)
+
+    # ---- Deterministic enrichment hooks ----
+    df, shock_manifest = attach_shock_z_if_enabled(df, cfg_resolved, dataset_id=dataset_id_final)
+    df, regime_fx_manifest = attach_regime_fx_if_enabled(df, cfg_resolved, dataset_id=dataset_id_final)
+
     strat_cfg = cfg_resolved["strategy"]
     strategy = make_strategy(strat_cfg["name"], strat_cfg.get("params", {}))
 
-    intents_by_bar = []
+    intents_by_bar: list[Any] = []
     context = {
         "symbol": cfg_resolved["symbol"],
         "timeframe": cfg_resolved["timeframe"],
@@ -557,16 +522,18 @@ def run_from_config(
     for i in range(len(df)):
         intents_by_bar.append(strategy.on_bar(i, df, context))
 
-    # ---- APPLY ENTRY DELAY (orchestrator-layer) ----
+    intent_diag = _summarize_intents(intents_by_bar, sample_max=5)
+
+    # ---- APPLY ENTRY DELAY ----
     exe_cfg = cfg_resolved.get("execution", {}) or {}
     delay_bars = _norm_int(exe_cfg.get("entry_delay_bars"))
     if delay_bars is None:
-        delay_bars = _norm_int(exe_cfg.get("entry_delay"))  # backward compatibility
+        delay_bars = _norm_int(exe_cfg.get("entry_delay"))
     delay_bars = int(delay_bars or 0)
 
     intents_by_bar, entry_delay_report = apply_entry_delay(intents_by_bar, delay_bars=delay_bars)
 
-    # Resolve pip-based costs into price units for the engine
+    # Costs resolve
     costs_cfg = dict(cfg_resolved.get("costs", {}))
     pip_size = float(instrument.get("pip_size", 0.0) or 0.0)
 
@@ -600,7 +567,14 @@ def run_from_config(
     pf = metrics_raw.get("profit_factor")
     metrics_raw["profit_factor_is_inf"] = isinstance(pf, float) and (not math.isfinite(pf))
 
-    # Execution / effective execution
+    # Intent diagnostics in metrics
+    metrics_raw.update({
+        "intents_total_bars": intent_diag["intents_total_bars"],
+        "intents_non_null_bars": intent_diag["intents_non_null_bars"],
+        "intents_non_empty_bars": intent_diag["intents_non_empty_bars"],
+    })
+
+    # Execution diagnostics
     metrics_raw["execution_policy_id"] = (exe_cfg.get("policy_id") if isinstance(exe_cfg, dict) else None)
     metrics_raw["execution_fill_mode"] = (exe_cfg.get("fill_mode") if isinstance(exe_cfg, dict) else None)
     metrics_raw["execution_intrabar_path"] = (
@@ -612,7 +586,6 @@ def run_from_config(
     metrics_raw["costs_spread_pips_effective"] = spread_pips_eff
     metrics_raw["costs_slippage_pips_effective"] = slippage_pips_eff
 
-    # Entry delay diagnostics
     _flatten_entry_delay_into_metrics(metrics_raw, entry_delay_report)
 
     # Dataset identity fields
@@ -642,54 +615,7 @@ def run_from_config(
     metrics_raw["risk_final_realized_R_today"] = risk_report.get("final_realized_R_today")
     metrics_raw["risk_final_stopped_today"] = risk_report.get("final_stopped_today")
 
-    # Guardrails v2 summary into metrics
-    gr = (risk_report.get("guardrails") or {})
-    gr_cfg = (gr.get("guardrails_cfg") or {})
-    gr_blocked = (gr.get("blocked") or {})
-    gr_forced = (gr.get("forced_exits") or {})
-
-    metrics_raw["gr_time_window_enabled"] = gr_cfg.get("time_window_enabled")
-    metrics_raw["gr_window_start_utc"] = gr_cfg.get("window_start_utc")
-    metrics_raw["gr_window_end_utc"] = gr_cfg.get("window_end_utc")
-    metrics_raw["gr_max_concurrent_positions"] = gr_cfg.get("max_concurrent_positions")
-    metrics_raw["gr_max_holding_bars"] = gr_cfg.get("max_holding_bars")
-
-    metrics_raw["gr_blocked_by_max_concurrent_positions"] = gr_blocked.get("by_max_concurrent_positions")
-    metrics_raw["gr_blocked_by_time_window"] = gr_blocked.get("by_time_window")
-    metrics_raw["gr_forced_exit_by_max_holding_bars"] = gr_forced.get("by_max_holding_bars")
-
-    # Flatten audits
-    _flatten_entry_gate_into_metrics(metrics_raw, risk_report)
-    _flatten_fill_dropped_into_metrics(metrics_raw, risk_report)
-    _flatten_engine_util_into_metrics(metrics_raw, risk_report)
-    _flatten_forced_exits_into_metrics(metrics_raw, risk_report)
-
-    # ----------------------------
-    # Research-grade validity layer
-    # ----------------------------
-    n_trades = int(metrics_raw.get("n_trades", 0) or 0)
-    forced_total = int(metrics_raw.get("forced_exits_total", 0) or 0)
-    non_forced_total = int(metrics_raw.get("non_forced_exits_total", 0) or max(0, n_trades - forced_total))
-
-    allowed_forced = _allowed_forced_exits_total(metrics_raw, cfg_resolved)
-    valid_trades = non_forced_total + allowed_forced
-
-    metrics_raw["valid_trades"] = int(valid_trades)
-
-    attempted = metrics_raw.get("entry_gate_v2_attempted_entries")
-    if attempted is None:
-        attempted = metrics_raw.get("entry_gate_attempted_entries")
-    if attempted is None:
-        attempted = n_trades
-
-    try:
-        attempted_i = int(attempted or 0)
-    except Exception:
-        attempted_i = 0
-
-    metrics_raw["valid_trade_ratio"] = (valid_trades / attempted_i) if attempted_i > 0 else None
-
-    # status (needs cfg_resolved for allowed forced exits policy)
+    # status
     status_block = _compute_run_status(metrics_raw, cfg_resolved)
     metrics_raw.update(status_block)
 
@@ -709,11 +635,9 @@ def run_from_config(
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-    # Persist dataset metadata
     dataset_dict = dataset_meta.to_dict()
     dataset_dict["dataset_id"] = dataset_id_final
 
-    # Persist policy audit
     execution_policy_block: Dict[str, Any] | None = None
     if pol_res is not None:
         execution_policy_block = {
@@ -737,6 +661,10 @@ def run_from_config(
         },
         "instrument": cfg_resolved.get("instrument", {}),
         "dataset_registry": cfg_resolved.get("dataset_registry", {}) or {},
+        "shock_z": shock_manifest,
+        "regime_fx": regime_fx_manifest,
+        "dist_to_anchor": dist_anchor_manifest,
+        "intent_diagnostics": intent_diag,
         "strategy": cfg_resolved["strategy"],
         "execution": cfg_resolved.get("execution", {}) or {},
         "execution_policy": execution_policy_block,
@@ -768,7 +696,7 @@ def run_from_config(
         },
         "cfg_hash_sha256": hashlib.sha256(_canonical_cfg_json(cfg_resolved).encode("utf-8")).hexdigest(),
     }
-    (run_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    (run_dir / "run_manifest.json").write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
 
     return {
         "metrics": metrics,
@@ -802,29 +730,19 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description="Run backtest from YAML config.")
     parser.add_argument("config", help="Path to YAML config (e.g., configs/run_example.yaml)")
-    parser.add_argument(
-        "--out-dir",
-        default="results/runs",
-        help="Output root directory for runs (default: results/runs)",
-    )
-    parser.add_argument(
-        "--print-metrics",
-        action="store_true",
-        help="Print metrics JSON to stdout (optional).",
-    )
+    parser.add_argument("--out-dir", default="results/runs", help="Output root directory (default: results/runs)")
+    parser.add_argument("--print-metrics", action="store_true", help="Print metrics JSON to stdout.")
     parser.add_argument(
         "--set",
         action="append",
         default=[],
-        help="Override config value using dotted path. Repeatable. Example: --set risk.force_exit_on_eof=false",
+        help="Override config value using dotted path. Repeatable.",
     )
 
     args = parser.parse_args(argv)
 
     try:
         cfg = _load_yaml_cfg(args.config)
-
-        # Apply CLI overrides BEFORE policy application & validation
         cli_overrides = _apply_cli_overrides(cfg, args.set)
 
         out = run_from_config(cfg, out_dir=args.out_dir, cli_overrides=cli_overrides)

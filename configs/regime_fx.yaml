@@ -1,0 +1,29 @@
+version: "1"
+
+features:
+  er:
+    lookback: 20
+    warmup: "nan"
+  dp:
+    lookback: 20
+    warmup: "nan"
+
+thresholds:
+  mode: "artifact"
+  artifact_path: "artifacts/regime_fx_thresholds__eurusd_m5__2022_2024__p30_p70.json"
+
+state_machine:
+  enabled: true
+  confirm_bars: 2
+  min_state_bars: 9
+  cooldown_bars: 9
+  hysteresis:
+    enabled: true
+    margin_frac: 0.10
+
+output:
+  columns:
+    er: "er"
+    dp: "dp"
+    raw_regime: "raw_regime"
+    state_regime: "state_regime"
