@@ -1,3 +1,4 @@
+# src/backtester/data/loader.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -39,7 +40,6 @@ def _coerce_numeric(df: pd.DataFrame, cols: Iterable[str]) -> None:
 
 
 def _validate_ohlc_integrity(df: pd.DataFrame) -> None:
-    # high must be >= open/close, low must be <= open/close
     bad_high = df["high"] < df[["open", "close"]].max(axis=1)
     bad_low = df["low"] > df[["open", "close"]].min(axis=1)
 
@@ -51,7 +51,6 @@ def _validate_ohlc_integrity(df: pd.DataFrame) -> None:
             f"Sample offending rows:\n{sample.to_string(index=False)}"
         )
 
-    # Also ensure high >= low
     bad_hl = df["high"] < df["low"]
     if bad_hl.any():
         sample = df[bad_hl].head(5).reset_index()
@@ -66,6 +65,7 @@ def load_bars_csv(
     *,
     return_fingerprint: bool = False,
     dataset_id: Optional[str] = None,
+    keep_extra_cols: bool = False,
 ) -> Union[pd.DataFrame, Tuple[pd.DataFrame, DatasetMetadata]]:
     """
     Load normalized OHLCV bars.
@@ -78,15 +78,14 @@ def load_bars_csv(
       - volume (numeric)
       - spread (numeric; in price units if provided)
 
-    Output:
-      - DataFrame indexed by UTC Timestamp (index name: 'time')
-      - Sorted ascending by time
-      - No duplicate timestamps (duplicates raise error to avoid silent data issues)
-      - Canonical columns kept: open, high, low, close, volume?, spread?
+    keep_extra_cols:
+      - False (default): return only canonical OHLC(+optional) columns.
+      - True: return all columns from source CSV, but still validates OHLC integrity and sorts/dedups by time.
+        (Fingerprint is still computed ONLY from canonical OHLC columns.)
 
     If return_fingerprint=True:
       - requires dataset_id
-      - returns (df, DatasetMetadata) computed from canonical time+OHLC representation
+      - returns (df_out, DatasetMetadata) where DatasetMetadata is computed from canonical OHLC only.
     """
     p = Path(path)
     if not p.exists():
@@ -118,7 +117,7 @@ def load_bars_csv(
             f"{sample.to_string(index=False)}"
         )
 
-    # Coerce numerics (required + optional if present)
+    # Coerce required OHLC + optional columns if present
     numeric_cols = ["open", "high", "low", "close"] + [c for c in _OPTIONAL_COLS if c in df.columns]
     _coerce_numeric(df, numeric_cols)
 
@@ -126,12 +125,15 @@ def load_bars_csv(
     df = df.set_index("time")
     df.index.name = "time"
 
-    # Validate OHLC integrity
+    # Validate OHLC integrity (on full df)
     _validate_ohlc_integrity(df)
 
-    # Keep canonical columns only
-    keep = ["open", "high", "low", "close"] + [c for c in _OPTIONAL_COLS if c in df.columns]
-    df_out = df[keep].copy()
+    # Canonical slice (always exists)
+    canonical_cols = ["open", "high", "low", "close"] + [c for c in _OPTIONAL_COLS if c in df.columns]
+    df_canon = df[canonical_cols].copy()
+
+    # Output df (either canonical-only or full)
+    df_out = df.copy() if keep_extra_cols else df_canon
 
     if not return_fingerprint:
         return df_out
@@ -140,11 +142,11 @@ def load_bars_csv(
         raise ValueError("dataset_id is required when return_fingerprint=True")
 
     dataset_meta = build_dataset_metadata(
-        df_out,
+        df_canon,  # IMPORTANT: fingerprint only on canonical OHLC
         dataset_id=dataset_id,
         source_path=str(p),
         include_file_hash=True,
-        time_col=None,  # will infer __index__ because index.name == "time"
+        time_col=None,
         price_cols=("open", "high", "low", "close"),
         sort_by_time=True,
     )

@@ -356,6 +356,7 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
         cfg["data_path"],
         return_fingerprint=True,
         dataset_id=dataset_id_prov,
+        keep_extra_cols=True,  # <-- CLAVE para estrategias con features
     )
 
     # IMPORTANT: dataset_id should be stable and match tests: YYYY-MM-DD only
@@ -465,7 +466,26 @@ def _flatten_entry_delay_into_metrics(metrics: Dict[str, Any], entry_delay_repor
     )
 
 
-def _compute_run_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
+# ----------------------------
+# Validity / status policy
+# ----------------------------
+
+def _allowed_forced_exits_total(metrics: Dict[str, Any], cfg_resolved: Dict[str, Any]) -> int:
+    """
+    Allowed forced exits are those that are part of the strategy's intended lifecycle.
+
+    Current rule:
+      - If max_holding_bars > 0, then FORCE_MAX_HOLD is considered a valid (allowed) exit.
+        (It remains "forced" for auditability, but should NOT invalidate trades.)
+    """
+    max_hold_cfg = _extract_max_holding_bars_from_cfg(cfg_resolved)
+    if max_hold_cfg is None or int(max_hold_cfg) <= 0:
+        return 0
+
+    return int(metrics.get("exit_reason_count__FORCE_MAX_HOLD", 0) or 0)
+
+
+def _compute_run_status(metrics: Dict[str, Any], cfg_resolved: Dict[str, Any]) -> Dict[str, Any]:
     forced_total = int(metrics.get("forced_exits_total", 0) or 0)
 
     eof_forced = int(metrics.get("forced_exits__EOF", 0) or 0)
@@ -476,10 +496,13 @@ def _compute_run_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
 
     invalid_eof = (eof_forced + eof_skipped + forced_eof_total + eof_exits_total) > 0
 
+    allowed_forced = _allowed_forced_exits_total(metrics, cfg_resolved)
+    forced_non_allowed = max(0, forced_total - allowed_forced)
+
     status = "OK"
     if invalid_eof:
         status = "INVALID_SAMPLE_EOF"
-    elif forced_total > 0:
+    elif forced_non_allowed > 0:
         status = "OK_FORCED_EXITS_PRESENT"
 
     return {
@@ -487,6 +510,8 @@ def _compute_run_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
         "invalid_eof": bool(invalid_eof),
         "eof_incomplete_count": int(eof_skipped),
         "eof_forced_count": int(eof_forced),
+        "allowed_forced_exits_total": int(allowed_forced),
+        "forced_exits_non_allowed_total": int(forced_non_allowed),
     }
 
 
@@ -639,11 +664,17 @@ def run_from_config(
     _flatten_engine_util_into_metrics(metrics_raw, risk_report)
     _flatten_forced_exits_into_metrics(metrics_raw, risk_report)
 
+    # ----------------------------
     # Research-grade validity layer
+    # ----------------------------
     n_trades = int(metrics_raw.get("n_trades", 0) or 0)
-    forced_trades = int(metrics_raw.get("forced_exits_total", 0) or 0)
-    non_forced = int(metrics_raw.get("non_forced_exits_total", 0) or max(0, n_trades - forced_trades))
-    metrics_raw["valid_trades"] = int(non_forced)
+    forced_total = int(metrics_raw.get("forced_exits_total", 0) or 0)
+    non_forced_total = int(metrics_raw.get("non_forced_exits_total", 0) or max(0, n_trades - forced_total))
+
+    allowed_forced = _allowed_forced_exits_total(metrics_raw, cfg_resolved)
+    valid_trades = non_forced_total + allowed_forced
+
+    metrics_raw["valid_trades"] = int(valid_trades)
 
     attempted = metrics_raw.get("entry_gate_v2_attempted_entries")
     if attempted is None:
@@ -656,9 +687,10 @@ def run_from_config(
     except Exception:
         attempted_i = 0
 
-    metrics_raw["valid_trade_ratio"] = (non_forced / attempted_i) if attempted_i > 0 else None
+    metrics_raw["valid_trade_ratio"] = (valid_trades / attempted_i) if attempted_i > 0 else None
 
-    status_block = _compute_run_status(metrics_raw)
+    # status (needs cfg_resolved for allowed forced exits policy)
+    status_block = _compute_run_status(metrics_raw, cfg_resolved)
     metrics_raw.update(status_block)
 
     metrics = _sanitize_for_json(metrics_raw)

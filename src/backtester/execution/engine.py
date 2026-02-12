@@ -22,6 +22,9 @@ class Trade:
     tag: str
     exit_reason: str
 
+    # Research-grade duration field (derived from timestamps; avoids gaps artifacts)
+    hold_minutes: float | None = None
+
     # Bar indices (critical for research: duration in TRUE bars, not time gaps)
     entry_idx: int | None = None
     exit_idx: int | None = None
@@ -29,7 +32,8 @@ class Trade:
     # Persist SL/TP used for this trade (if available) so research metrics can compute R
     sl_price: float | None = None
     tp_price: float | None = None
-    # Formal R contract: risk measured in price units
+
+    # Formal R contract: risk measured in price units (can be proxy)
     risk_price: float | None = None
 
 
@@ -54,23 +58,24 @@ class SimpleBarEngine:
     eof_buffer_bars semantics:
       - 0 => DISABLED
       - >0 => block new entries if remaining_bars_to_eof <= eof_buffer_bars
-              (prevents EOF artifacts under strict_no_eof)
+
+    Time-stop strategies (no SL/TP in price):
+      - Set risk.allow_missing_sl: true
+      - Provide risk.risk_proxy_price > 0 (in price units) to enable R metrics
     """
 
     def __init__(self, *, costs: Dict[str, Any], exec_cfg: Dict[str, Any], risk_cfg: Optional[Dict[str, Any]] = None):
         self.costs = costs
         self.exec_cfg = exec_cfg
-        self.tie_break = exec_cfg.get("intrabar_tie", "sl_first")  # sl_first | tp_first
-        self.fill_mode = exec_cfg.get("fill_mode", "close")        # close | next_open
+        self.tie_break = exec_cfg.get("intrabar_tie", "sl_first")
+        self.fill_mode = exec_cfg.get("fill_mode", "close")
 
         raw_path = str(exec_cfg.get("intrabar_path", "OHLC")).replace(" ", "").upper()
         self.intrabar_path = raw_path if raw_path in ("OHLC", "OLHC") else "OHLC"
 
-        # ---- Normalize risk_cfg (single source of truth) ----
         risk_cfg_in = risk_cfg or {}
         risk_cfg_norm: Dict[str, Any] = dict(risk_cfg_in)
 
-        # ARCH A/B control (default True for research)
         self.force_exit_on_eof: bool = bool(risk_cfg_norm.get("force_exit_on_eof", True))
         risk_cfg_norm["force_exit_on_eof"] = self.force_exit_on_eof
 
@@ -94,12 +99,10 @@ class SimpleBarEngine:
         self.eof_buffer_bars: int = _ebb_int
         risk_cfg_norm["eof_buffer_bars"] = int(self.eof_buffer_bars)
 
-        # optional: block entries on last bar (still useful, but weaker than eof_buffer_bars)
         self.no_entry_on_last_bar: bool = bool(risk_cfg_norm.get("no_entry_on_last_bar", False))
         risk_cfg_norm["no_entry_on_last_bar"] = bool(self.no_entry_on_last_bar)
 
-        # ---- NEW: minimum allowed risk at fill time (price units) ----
-        # Example EURUSD: 2 pips => 0.0002
+        # min_risk_price (only applies when SL exists)
         _mrp = risk_cfg_norm.get("min_risk_price", 0.0)
         try:
             _mrp_f = float(_mrp) if _mrp is not None else 0.0
@@ -109,6 +112,19 @@ class SimpleBarEngine:
             _mrp_f = 0.0
         self.min_risk_price: float = _mrp_f
         risk_cfg_norm["min_risk_price"] = float(self.min_risk_price)
+
+        # --- NEW: allow time-stop strategies with no SL ---
+        self.allow_missing_sl: bool = bool(risk_cfg_norm.get("allow_missing_sl", False))
+        risk_cfg_norm["allow_missing_sl"] = bool(self.allow_missing_sl)
+
+        _rpp = risk_cfg_norm.get("risk_proxy_price", None)
+        try:
+            self.risk_proxy_price: float | None = float(_rpp) if _rpp is not None else None
+        except Exception:
+            self.risk_proxy_price = None
+        if self.risk_proxy_price is not None and (not pd.notna(self.risk_proxy_price) or self.risk_proxy_price <= 0):
+            self.risk_proxy_price = None
+        risk_cfg_norm["risk_proxy_price"] = float(self.risk_proxy_price) if self.risk_proxy_price is not None else None
 
         # v1 daily risk gates
         self.max_daily_loss_R: Optional[float] = (
@@ -122,22 +138,15 @@ class SimpleBarEngine:
             self.cooldown_bars = 0
         risk_cfg_norm["cooldown_bars"] = self.cooldown_bars
 
-        # Engine is single-position today. Refuse configs that claim otherwise.
         mcp = int(risk_cfg_norm.get("max_concurrent_positions", 1) or 1)
         if mcp != 1:
             raise ValueError(
                 "ENGINE_SINGLE_POSITION_ONLY: max_concurrent_positions must be 1 for SimpleBarEngine.\n"
                 f"got max_concurrent_positions={mcp}\n"
-                "Fix: set risk.max_concurrent_positions: 1 (or implement multi-position engine).\n"
             )
 
-        # Guardrails v2 (use normalized cfg to avoid semantic drift)
         self.guardrails = Guardrails(risk_cfg_norm)
-
-        # Persist normalized cfg for reporting
         self._risk_cfg_norm = risk_cfg_norm
-
-        # Exposed after run() for persistence/audit
         self.last_risk_report: Dict[str, Any] = {}
 
     def _apply_costs(self, pnl: float, qty: float) -> float:
@@ -168,7 +177,6 @@ class SimpleBarEngine:
     def _decide_exit_reason(
         self, o: float, h: float, l: float, c: float, pos_side: str, sl: float, tp: float
     ) -> Optional[str]:
-        """Decide whether SL or TP happens first within the bar using intrabar_path."""
         hit_sl = l <= sl <= h
         hit_tp = l <= tp <= h
         if not hit_sl and not hit_tp:
@@ -178,10 +186,9 @@ class SimpleBarEngine:
         if hit_tp and not hit_sl:
             return "TP"
 
-        # both hit
         if self.intrabar_path == "OHLC":
             return "TP" if pos_side == "BUY" else "SL"
-        else:  # OLHC
+        else:
             return "SL" if pos_side == "BUY" else "TP"
 
     @staticmethod
@@ -205,9 +212,15 @@ class SimpleBarEngine:
         d[key] = int(d.get(key, 0)) + int(n)
 
     def _validate_sl_relation(self, *, side: str, entry_price: float, sl_price: Optional[float]) -> Tuple[bool, str]:
-        """Return (ok, reason). For research-grade R, SL must exist and be on the correct side."""
+        """
+        If allow_missing_sl=True, missing SL is OK (time-stop strategies).
+        Otherwise: SL must exist and be on correct side of entry.
+        """
         if sl_price is None:
+            if self.allow_missing_sl:
+                return True, "OK_NO_SL"
             return False, "MISSING_SL"
+
         sl = float(sl_price)
         ep = float(entry_price)
         if side == "BUY":
@@ -219,9 +232,19 @@ class SimpleBarEngine:
         return True, "OK"
 
     def _validate_min_risk(self, *, entry_price: float, sl_price: Optional[float]) -> Tuple[bool, str, float]:
-        """Return (ok, reason, risk_price). Enforces min_risk_price when configured."""
+        """
+        Return (ok, reason, risk_price).
+
+        - If SL exists: rp = abs(entry - sl), enforce min_risk_price if configured.
+        - If SL missing AND allow_missing_sl: require risk_proxy_price > 0.
+        """
         if sl_price is None:
-            return False, "MISSING_SL", 0.0
+            if not self.allow_missing_sl:
+                return False, "MISSING_SL", 0.0
+            if self.risk_proxy_price is None or self.risk_proxy_price <= 0:
+                return False, "MISSING_RISK_PROXY", 0.0
+            return True, "OK_PROXY", float(self.risk_proxy_price)
+
         rp = abs(float(entry_price) - float(sl_price))
         if rp <= 0:
             return False, "ZERO_RISK", float(rp)
@@ -254,6 +277,13 @@ class SimpleBarEngine:
 
         pnl = self._apply_costs(raw_pnl, pos_qty)
 
+        # Compute hold_minutes deterministically
+        hold_m: float | None = None
+        try:
+            hold_m = float((pd.Timestamp(ts) - pd.Timestamp(entry_time)).total_seconds() / 60.0)
+        except Exception:
+            hold_m = None
+
         return Trade(
             entry_time=entry_time,
             exit_time=ts,
@@ -264,6 +294,7 @@ class SimpleBarEngine:
             pnl=float(pnl),
             tag=tag,
             exit_reason=exit_reason,
+            hold_minutes=hold_m,
             entry_idx=int(entry_idx) if entry_idx is not None else None,
             exit_idx=int(exit_idx) if exit_idx is not None else None,
             sl_price=sl_price,
@@ -312,7 +343,6 @@ class SimpleBarEngine:
         dropped_entries_total: int = 0
         dropped_entries_by_reason: Dict[str, int] = {}
 
-        # NEW: entry skip counters for fill-time validation
         entry_skipped_invalid_sl_relation: int = 0
         entry_skipped_missing_sl: int = 0
         entry_skipped_tiny_risk: int = 0
@@ -322,7 +352,7 @@ class SimpleBarEngine:
         last_bar_ts: Optional[pd.Timestamp] = None
         last_bar_close: Optional[float] = None
 
-        open_position_at_eof: bool = False  # ARCH A audit
+        open_position_at_eof: bool = False
 
         n_bars = int(len(df) or 0)
 
@@ -369,6 +399,8 @@ class SimpleBarEngine:
                         if reason_risk in ("MISSING_SL",):
                             entry_skipped_missing_sl += 1
                             self._bump(dropped_entries_by_reason, "ENTRY_SKIPPED_MISSING_SL")
+                        elif reason_risk == "MISSING_RISK_PROXY":
+                            self._bump(dropped_entries_by_reason, "ENTRY_SKIPPED_MISSING_RISK_PROXY")
                         else:
                             entry_skipped_tiny_risk += 1
                             self._bump(dropped_entries_by_reason, f"ENTRY_SKIPPED_{reason_risk}")
@@ -376,7 +408,6 @@ class SimpleBarEngine:
                         pending_intent = None
                         pending_tag = ""
                     else:
-                        # commit position
                         pos_side = side
                         pos_qty = qty
                         entry_price = float(filled_entry)
@@ -507,25 +538,21 @@ class SimpleBarEngine:
 
                     # ---- Guardrails v2 + EOF buffer gating ----
                     if not blocked:
-                        active_positions = 0  # flat by construction
+                        active_positions = 0
 
-                        # Compute remaining bars to EOF at the *fill bar*
                         fill_index = i + 1 if self.fill_mode == "next_open" else i
                         remaining_bars = (n_bars - 1) - int(fill_index)
 
-                        # Optional legacy: no entry on last bar
                         if self.no_entry_on_last_bar and fill_index >= (n_bars - 1):
                             blocked = True
                             blocked_reason = "V2_by_eof_buffer"
                             self._bump(blocked_v2_by_reason, "by_eof_buffer")
 
-                        # Strong rule: EOF buffer
                         if (not blocked) and (self.eof_buffer_bars > 0) and (remaining_bars <= self.eof_buffer_bars):
                             blocked = True
                             blocked_reason = "V2_by_eof_buffer"
                             self._bump(blocked_v2_by_reason, "by_eof_buffer")
 
-                        # Standard guardrails checks
                         if not blocked:
                             if self.fill_mode == "next_open":
                                 if i < n_bars - 1:
@@ -567,7 +594,6 @@ class SimpleBarEngine:
                             dropped_entries_total += 1
                             self._bump(dropped_entries_by_reason, "NO_NEXT_OPEN")
                     else:
-                        # Immediate fill at close
                         side = intent.side
                         qty = float(intent.qty)
                         filled_entry = self._fill_entry(c, side)
@@ -592,6 +618,8 @@ class SimpleBarEngine:
                             if reason_risk == "MISSING_SL":
                                 entry_skipped_missing_sl += 1
                                 self._bump(dropped_entries_by_reason, "ENTRY_SKIPPED_MISSING_SL")
+                            elif reason_risk == "MISSING_RISK_PROXY":
+                                self._bump(dropped_entries_by_reason, "ENTRY_SKIPPED_MISSING_RISK_PROXY")
                             else:
                                 entry_skipped_tiny_risk += 1
                                 self._bump(dropped_entries_by_reason, f"ENTRY_SKIPPED_{reason_risk}")
@@ -646,11 +674,9 @@ class SimpleBarEngine:
                 open_position_at_eof = True
                 self._bump(forced_exits, "EOF_SKIPPED_BY_POLICY")
 
-            # Reset internal state
             pos_side = None
             pending_intent = None
 
-        # Guardrails report from component
         gr_rep = self.guardrails.report()
         if not isinstance(gr_rep, dict):
             gr_rep = {"raw": gr_rep}
@@ -666,7 +692,6 @@ class SimpleBarEngine:
         bars_total = int(len(df) or 0)
         time_in_position_rate = (float(time_in_position_bars) / float(bars_total)) if bars_total > 0 else 0.0
 
-        # Expose risk/guardrails report for orchestrator persistence
         self.last_risk_report = {
             "risk_report_version": "v1",
             "risk_cfg": {
@@ -678,6 +703,8 @@ class SimpleBarEngine:
                 "eof_buffer_bars": int(self.eof_buffer_bars),
                 "no_entry_on_last_bar": bool(self.no_entry_on_last_bar),
                 "min_risk_price": float(self.min_risk_price),
+                "allow_missing_sl": bool(self.allow_missing_sl),
+                "risk_proxy_price": float(self.risk_proxy_price) if self.risk_proxy_price is not None else None,
             },
             "final_day_key_utc": current_day,
             "final_entries_today": entries_today,

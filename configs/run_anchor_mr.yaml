@@ -1,0 +1,56 @@
+name: "anchor_mr_eurusd_m5"
+symbol: "EURUSD"
+timeframe: "M5"
+data_path: "data/anchor_reversion_fx/data/eurusd_m5_features_from_parquet.csv"
+instrument:
+  data_source: "csv"
+  pip_size: 0.0001
+dataset_registry:
+  registry_dir: "data/registry"
+  allow_override: false
+  append_match_event: false
+strategy:
+  name: "AnchorReversionFX"
+  params:
+    qty: 1.0
+    # Signal
+    shock_z_entry: 4.0
+    min_dist_pips: 30
+    # ✅ map a tu columna real
+    col_dist_pips: "spread_ny_open"
+    dist_is_price: true
+    # Horizon/time-stop
+    horizon_bars: 24
+    # ✅ desactiva session gating (tu dataset no tiene 'session')
+    sessions: null
+    # Columns (opcionales, pero dejo explícito lo importante)
+    col_shock_z: "shock_z"
+    col_close: "close"
+    pip_size: 0.0001
+    # SL handling
+    sl_mode: "none"
+    catastrophic_sl_pips: 300.0
+execution:
+  policy_id: "baseline"
+  entry_delay_bars: 0
+costs:
+  spread_pips: 0.8
+  slippage_pips: 0.2
+  commission: 0.0
+  spread_pips_effective: 0.8
+  slippage_pips_effective: 0.2
+risk:
+  max_daily_loss_R: null
+  max_trades_per_day: null
+  cooldown_bars: 12
+  allow_missing_sl: true
+  risk_proxy_price: 0.0010
+  force_exit_on_eof: true
+  eof_buffer_bars: 30
+  max_concurrent_positions: 1
+  time_window_enabled: false
+  window_start_utc: "13:30"
+  window_end_utc: "16:00"
+  max_holding_bars: 36
+guardrails:
+  max_holding_bars: 36
