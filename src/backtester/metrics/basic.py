@@ -141,6 +141,12 @@ def summarize_trades(trades: Iterable[Any]) -> Dict[str, Any]:
       - exit_reason (optional str)
       - risk_price (optional float): risk in price units (proxy allowed)
       - sl_price/tp_price optional (used only for time-stop reclassification)
+
+    NOTE:
+      - R metrics here intentionally use pnl/risk_price (legacy behavior).
+      - If you want R to be *strictly* pnl/(risk_price*abs(qty)), you can extend
+        summarize_trades similarly to trades_to_dicts. For now we keep your metrics
+        output stable; the CSV will have correct R.
     """
     pnl_list: List[float] = []
     win_list: List[float] = []
@@ -209,7 +215,7 @@ def summarize_trades(trades: Iterable[Any]) -> Dict[str, Any]:
         else:
             non_forced_exits_total += 1
 
-        # --- R-space ---
+        # --- R-space (legacy) ---
         rp = _safe_float(getattr(t, "risk_price", None), default=None)
         if rp is None:
             continue
@@ -357,7 +363,10 @@ def trades_to_dicts(trades: Iterable[Any]) -> List[Dict[str, Any]]:
     """
     Convert trades to dicts for CSV persistence.
 
-    Persist risk_price and best-effort R (raw if valid, else None).
+    Persist risk_price and R using the formal contract:
+      R = pnl / (risk_price * abs(qty))
+
+    Also persist audit columns: side, qty, tag.
     """
     rows: List[Dict[str, Any]] = []
     for t in trades:
@@ -368,6 +377,12 @@ def trades_to_dicts(trades: Iterable[Any]) -> List[Dict[str, Any]]:
 
         d["entry_idx"] = getattr(t, "entry_idx", None)
         d["exit_idx"] = getattr(t, "exit_idx", None)
+
+        # ---- NEW: audit columns ----
+        d["side"] = getattr(t, "side", None)
+        qty = _safe_float(getattr(t, "qty", None), default=None)
+        d["qty"] = qty
+        d["tag"] = getattr(t, "tag", None)
 
         d["entry_price"] = getattr(t, "entry_price", None)
         d["exit_price"] = getattr(t, "exit_price", None)
@@ -385,9 +400,14 @@ def trades_to_dicts(trades: Iterable[Any]) -> List[Dict[str, Any]]:
         rp = _safe_float(getattr(t, "risk_price", None), default=None)
         d["risk_price"] = rp
 
-        if pnl is not None and rp is not None and math.isfinite(rp) and rp > RISK_EPS:
-            R_raw = pnl / rp
-            d["R"] = float(R_raw) if math.isfinite(R_raw) else None
+        # Formal R contract
+        if pnl is not None and rp is not None and math.isfinite(rp) and rp > RISK_EPS and qty is not None and qty != 0:
+            denom = float(rp) * abs(float(qty))
+            if denom > 0:
+                R_raw = float(pnl) / denom
+                d["R"] = float(R_raw) if math.isfinite(R_raw) else None
+            else:
+                d["R"] = None
         else:
             d["R"] = None
 

@@ -407,16 +407,68 @@ def _flatten_entry_delay_into_metrics(metrics: Dict[str, Any], entry_delay_repor
     )
 
 
-def _allowed_forced_exits_total(metrics: Dict[str, Any], cfg_resolved: Dict[str, Any]) -> int:
+# ----------------------------
+# Forced exit accounting
+# ----------------------------
+
+def _is_regime_fx_enabled(cfg_resolved: Dict[str, Any]) -> bool:
+    rx = cfg_resolved.get("regime_fx", {}) or {}
+    if isinstance(rx, dict):
+        return bool(rx.get("enabled", False))
+    return False
+
+
+def _allowed_forced_exit_reasons(cfg_resolved: Dict[str, Any]) -> set[str]:
+    """
+    Determine which FORCE_* exit reasons are allowed for this run.
+
+    Priority:
+      1) risk.allowed_forced_exit_reasons (explicit list)
+      2) inferred defaults:
+         - FORCE_MAX_HOLD if max_holding_bars enabled (>0)
+         - FORCE_REGIME_EXIT if regime_fx.enabled == true
+    """
+    risk = cfg_resolved.get("risk", {}) or {}
+    reasons_raw = risk.get("allowed_forced_exit_reasons", None)
+
+    out: set[str] = set()
+
+    if isinstance(reasons_raw, (list, tuple)):
+        for x in reasons_raw:
+            if isinstance(x, str) and x.strip():
+                out.add(x.strip())
+
+    if out:
+        return out
+
+    # inferred defaults
     max_hold_cfg = _extract_max_holding_bars_from_cfg(cfg_resolved)
-    if max_hold_cfg is None or int(max_hold_cfg) <= 0:
-        return 0
-    return int(metrics.get("exit_reason_count__FORCE_MAX_HOLD", 0) or 0)
+    if max_hold_cfg is not None and int(max_hold_cfg) > 0:
+        out.add("FORCE_MAX_HOLD")
+
+    if _is_regime_fx_enabled(cfg_resolved):
+        out.add("FORCE_REGIME_EXIT")
+
+    return out
+
+
+def _allowed_forced_exits_total(metrics: Dict[str, Any], cfg_resolved: Dict[str, Any]) -> int:
+    """
+    Sum counts of allowed FORCE_* exit reasons using metrics keys:
+      exit_reason_count__<REASON>
+    """
+    allowed = _allowed_forced_exit_reasons(cfg_resolved)
+    total = 0
+    for r in sorted(allowed):
+        k = f"exit_reason_count__{r}"
+        total += int(metrics.get(k, 0) or 0)
+    return int(total)
 
 
 def _compute_run_status(metrics: Dict[str, Any], cfg_resolved: Dict[str, Any]) -> Dict[str, Any]:
     forced_total = int(metrics.get("forced_exits_total", 0) or 0)
 
+    # NOTE: these keys depend on summarize_trades() output; keep existing behavior
     eof_forced = int(metrics.get("forced_exits__EOF", 0) or 0)
     eof_skipped = int(metrics.get("forced_exits__EOF_SKIPPED_BY_POLICY", 0) or 0)
 

@@ -62,6 +62,14 @@ class SimpleBarEngine:
     Time-stop strategies (no SL/TP in price):
       - Set risk.allow_missing_sl: true
       - Provide risk.risk_proxy_price > 0 (in price units) to enable R metrics
+
+    NEW (regime-aware exits / gating):
+      - risk.regime_exit_enabled: bool
+      - risk.regime_exit_col: str (default "state_regime")
+      - risk.regime_exit_allowed: list[str] (e.g. ["RANGE"])
+      - risk.regime_gate_entries_enabled: bool
+      - risk.regime_gate_entries_col: str (default "state_regime")
+      - risk.regime_gate_entries_allowed: list[str]
     """
 
     def __init__(self, *, costs: Dict[str, Any], exec_cfg: Dict[str, Any], risk_cfg: Optional[Dict[str, Any]] = None):
@@ -137,6 +145,36 @@ class SimpleBarEngine:
         if self.cooldown_bars < 0:
             self.cooldown_bars = 0
         risk_cfg_norm["cooldown_bars"] = self.cooldown_bars
+
+        # -------- REGIME EXIT / ENTRY GATING (engine-level) --------
+        self.regime_exit_enabled: bool = bool(risk_cfg_norm.get("regime_exit_enabled", False))
+        self.regime_exit_col: str = str(risk_cfg_norm.get("regime_exit_col", "state_regime"))
+        _rea = risk_cfg_norm.get("regime_exit_allowed", None)
+        if isinstance(_rea, (list, tuple, set)):
+            self.regime_exit_allowed: Set[str] = set([str(x) for x in _rea])
+        elif _rea is None:
+            self.regime_exit_allowed = set()
+        else:
+            self.regime_exit_allowed = set([str(_rea)])
+
+        self.regime_gate_entries_enabled: bool = bool(risk_cfg_norm.get("regime_gate_entries_enabled", False))
+        self.regime_gate_entries_col: str = str(risk_cfg_norm.get("regime_gate_entries_col", "state_regime"))
+        _rgea = risk_cfg_norm.get("regime_gate_entries_allowed", None)
+        if isinstance(_rgea, (list, tuple, set)):
+            self.regime_gate_entries_allowed: Set[str] = set([str(x) for x in _rgea])
+        elif _rgea is None:
+            self.regime_gate_entries_allowed = set()
+        else:
+            self.regime_gate_entries_allowed = set([str(_rgea)])
+
+        # Normalize into cfg for manifest/debug visibility
+        risk_cfg_norm["regime_exit_enabled"] = bool(self.regime_exit_enabled)
+        risk_cfg_norm["regime_exit_col"] = str(self.regime_exit_col)
+        risk_cfg_norm["regime_exit_allowed"] = sorted(list(self.regime_exit_allowed))
+        risk_cfg_norm["regime_gate_entries_enabled"] = bool(self.regime_gate_entries_enabled)
+        risk_cfg_norm["regime_gate_entries_col"] = str(self.regime_gate_entries_col)
+        risk_cfg_norm["regime_gate_entries_allowed"] = sorted(list(self.regime_gate_entries_allowed))
+        # ----------------------------------------------------------
 
         mcp = int(risk_cfg_norm.get("max_concurrent_positions", 1) or 1)
         if mcp != 1:
@@ -321,6 +359,9 @@ class SimpleBarEngine:
         pending_intent: Optional[OrderIntent] = None
         pending_tag: str = ""
 
+        # NEW: pending forced exit at next bar open (for next_open semantics)
+        pending_exit_reason: Optional[str] = None
+
         current_day: Optional[str] = None
         entries_today: int = 0
         realized_R_today: float = 0.0
@@ -371,6 +412,54 @@ class SimpleBarEngine:
                 stopped_today = False
 
             o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+
+            # ------------------------------------------------------------
+            # NEW: apply pending forced exit at this bar OPEN (next_open semantics)
+            # ------------------------------------------------------------
+            if (pos_side is not None) and (entry_time is not None) and (entry_index is not None) and (pending_exit_reason is not None):
+                trade = self._close_position(
+                    ts=ts,
+                    exit_level=float(o),
+                    exit_reason=str(pending_exit_reason),
+                    pos_side=pos_side,
+                    pos_qty=pos_qty,
+                    entry_price=float(entry_price),
+                    entry_time=entry_time,
+                    tag=tag,
+                    sl_price=pos_sl_price,
+                    tp_price=pos_tp_price,
+                    risk_price=pos_risk_price,
+                    entry_idx=int(entry_index),
+                    exit_idx=int(i),
+                )
+                trades.append(trade)
+
+                self._bump(forced_exits, str(pending_exit_reason))
+
+                r_mult = self._safe_r_multiple(trade.pnl, trade.risk_price, trade.qty)
+                if r_mult is not None:
+                    realized_R_today += float(r_mult)
+
+                if (self.max_daily_loss_R is not None) and (realized_R_today <= -abs(float(self.max_daily_loss_R))):
+                    stopped_today = True
+
+                if self.cooldown_bars > 0:
+                    cooldown_until_index = max(cooldown_until_index, i + self.cooldown_bars + 1)
+
+                # Reset position + pending exit
+                pos_side = None
+                pos_qty = 0.0
+                entry_price = 0.0
+                entry_time = None
+                entry_index = None
+                sl = None
+                tp = None
+                tag = ""
+                pos_sl_price = None
+                pos_tp_price = None
+                pos_risk_price = None
+                pending_exit_reason = None
+            # ------------------------------------------------------------
 
             # Fill pending entry at this bar open
             if pos_side is None and pending_intent is not None:
@@ -458,8 +547,28 @@ class SimpleBarEngine:
                         else:
                             exit_reason, exit_level = "SL", float(sl)
 
+                # NEW: FORCE_REGIME_EXIT (no lookahead)
+                # Decision uses CURRENT bar regime value; exit occurs at NEXT bar open if fill_mode=next_open.
+                if exit_reason is None and self.regime_exit_enabled and len(self.regime_exit_allowed) > 0:
+                    if self.regime_exit_col in df.columns:
+                        cur_reg = row.get(self.regime_exit_col, None)
+                        cur_reg_s = str(cur_reg) if cur_reg is not None and pd.notna(cur_reg) else None
+                        if cur_reg_s is not None and (cur_reg_s not in self.regime_exit_allowed):
+                            if self.fill_mode == "next_open":
+                                if i < n_bars - 1:
+                                    pending_exit_reason = "FORCE_REGIME_EXIT"
+                                else:
+                                    # No next open; fallback to close
+                                    exit_reason, exit_level = "FORCE_REGIME_EXIT", float(c)
+                                    self._bump(forced_exits, "FORCE_REGIME_EXIT_FALLBACK_CLOSE")
+                            else:
+                                exit_reason, exit_level = "FORCE_REGIME_EXIT", float(c)
+                    else:
+                        # Config enabled but column missing => treat as config issue (do not crash engine)
+                        self._bump(forced_exits, "FORCE_REGIME_EXIT_MISSING_COL")
+
                 # FORCE_MAX_HOLD only if enabled (>0)
-                if exit_reason is None and (self.max_holding_bars is not None):
+                if exit_reason is None and pending_exit_reason is None and (self.max_holding_bars is not None):
                     holding_bars = i - int(entry_index)
                     force, force_reason = self.guardrails.should_force_exit(holding_bars=holding_bars)
                     if force:
@@ -510,6 +619,7 @@ class SimpleBarEngine:
                     pos_sl_price = None
                     pos_tp_price = None
                     pos_risk_price = None
+                    pending_exit_reason = None
 
             # Schedule entries (only if flat and no pending)
             if pos_side is None and pending_intent is None:
@@ -552,6 +662,19 @@ class SimpleBarEngine:
                             blocked = True
                             blocked_reason = "V2_by_eof_buffer"
                             self._bump(blocked_v2_by_reason, "by_eof_buffer")
+
+                        # NEW: regime gating of entries (no lookahead beyond chosen fill_index)
+                        if (not blocked) and self.regime_gate_entries_enabled and len(self.regime_gate_entries_allowed) > 0:
+                            col = self.regime_gate_entries_col
+                            if col in df.columns and 0 <= fill_index < n_bars:
+                                reg_v = df.iloc[int(fill_index)][col]
+                                reg_s = str(reg_v) if reg_v is not None and pd.notna(reg_v) else None
+                                if reg_s is None or (reg_s not in self.regime_gate_entries_allowed):
+                                    blocked = True
+                                    blocked_reason = "REGIME_GATE"
+                                    self._bump(blocked_v2_by_reason, "by_regime_gate")
+                            else:
+                                self._bump(blocked_v2_by_reason, "by_regime_gate_missing_col")
 
                         if not blocked:
                             if self.fill_mode == "next_open":
@@ -705,18 +828,22 @@ class SimpleBarEngine:
                 "min_risk_price": float(self.min_risk_price),
                 "allow_missing_sl": bool(self.allow_missing_sl),
                 "risk_proxy_price": float(self.risk_proxy_price) if self.risk_proxy_price is not None else None,
+                "regime_exit_enabled": bool(self.regime_exit_enabled),
+                "regime_exit_col": str(self.regime_exit_col),
+                "regime_exit_allowed": sorted(list(self.regime_exit_allowed)),
+                "regime_gate_entries_enabled": bool(self.regime_gate_entries_enabled),
+                "regime_gate_entries_col": str(self.regime_gate_entries_col),
+                "regime_gate_entries_allowed": sorted(list(self.regime_gate_entries_allowed)),
             },
             "final_day_key_utc": current_day,
             "final_entries_today": entries_today,
             "final_realized_R_today": realized_R_today,
             "final_stopped_today": stopped_today,
-
             "blocked": {
                 "by_daily_stop": n_blocked_by_daily_stop,
                 "by_max_trades_per_day": n_blocked_by_max_trades,
                 "by_cooldown": n_blocked_by_cooldown,
             },
-
             "entry_gate": {
                 "attempted_entries": attempted_entries,
                 "blocked_total": blocked_total,
@@ -726,15 +853,12 @@ class SimpleBarEngine:
                 "entry_skipped_missing_sl": int(entry_skipped_missing_sl),
                 "entry_skipped_tiny_risk": int(entry_skipped_tiny_risk),
             },
-
             "guardrails": gr_rep,
             "forced_exits": dict(forced_exits),
-
             "entry_fill_dropped": {
                 "dropped_total": int(dropped_entries_total),
                 "dropped_by_reason": dict(dropped_entries_by_reason),
             },
-
             "engine": {
                 "bars_total": int(bars_total),
                 "time_in_position_bars": int(time_in_position_bars),

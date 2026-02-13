@@ -11,3 +11,6 @@ data/derived/
 *.bak2
 *.bak3
 baseline
+data/**/data/*.csv
+data/**/data/*.parquet
+results/
