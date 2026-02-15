@@ -54,12 +54,10 @@ def _parse_scalar(s: str) -> Any:
         return ""
 
     # JSON container support: sessions=[], params={"a":1}, etc.
-    # Only attempt if it looks like a JSON container; otherwise keep scalar rules.
     if raw.startswith("[") or raw.startswith("{"):
         try:
             return json.loads(raw)
         except Exception:
-            # Fall back to scalar parsing
             pass
 
     low = raw.lower()
@@ -135,6 +133,28 @@ def _apply_cli_overrides(cfg: Dict[str, Any], set_items: list[str] | None) -> Di
 
 
 # ----------------------------
+# Deep merge (CRÍTICO)
+# ----------------------------
+
+def _deep_merge(base: Any, overlay: Any) -> Any:
+    """
+    Deep merge dictionaries without dropping unknown keys.
+    overlay wins on conflicts.
+    - If both are dict -> merge recursively
+    - Else -> overlay (if overlay is not None) else base
+    """
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        out = dict(base)
+        for k, v in overlay.items():
+            if k in out:
+                out[k] = _deep_merge(out[k], v)
+            else:
+                out[k] = v
+        return out
+    return overlay if overlay is not None else base
+
+
+# ----------------------------
 # Helpers
 # ----------------------------
 
@@ -143,27 +163,23 @@ def _json_safe(obj: Any) -> Any:
     Make an object JSON-serializable deterministically.
     - Handles dataclasses (OrderIntent), pandas/numpy scalars, Path, sets, etc.
     """
-    # dataclass (OrderIntent, reports, etc.)
     if is_dataclass(obj):
         try:
             return _json_safe(asdict(obj))
         except Exception:
             return str(obj)
 
-    # pandas / numpy scalars
     try:
         if isinstance(obj, (pd.Timestamp,)):
             return obj.isoformat()
     except Exception:
         pass
 
-    # basic scalars
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
     if isinstance(obj, (str, int, bool)) or obj is None:
         return obj
 
-    # containers
     if isinstance(obj, dict):
         return {str(k): _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -171,16 +187,13 @@ def _json_safe(obj: Any) -> Any:
     if isinstance(obj, set):
         return sorted([_json_safe(v) for v in obj], key=lambda x: str(x))
 
-    # Paths
     if isinstance(obj, Path):
         return str(obj)
 
-    # fallback
     return str(obj)
 
 
 def _sanitize_for_json(obj: Any) -> Any:
-    # kept for metrics; safe enough, but you can swap to _json_safe if you want
     if isinstance(obj, float):
         return obj if math.isfinite(obj) else None
     if isinstance(obj, dict):
@@ -247,21 +260,38 @@ def _norm_int(x: Any) -> int | None:
     except Exception:
         return None
 
-
 def _capture_policy_sensitive_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     risk = cfg.get("risk", {}) or {}
+
+    # validity_mode puede estar en top-level o dentro de risk (tu YAML lo usa dentro de risk)
+    v = None
+    if isinstance(cfg.get("validity_mode"), str) and str(cfg.get("validity_mode")).strip():
+        v = str(cfg.get("validity_mode")).strip()
+    elif isinstance(risk.get("validity_mode"), str) and str(risk.get("validity_mode")).strip():
+        v = str(risk.get("validity_mode")).strip()
+
     return {
         "risk.eof_buffer_bars": _norm_int(risk.get("eof_buffer_bars", None)),
+        "risk.validity_mode": v,
     }
 
 
 def _apply_policy_sensitive_overrides(cfg_resolved: Dict[str, Any], overrides: Dict[str, Any]) -> None:
+    # eof buffer
     eofb = overrides.get("risk.eof_buffer_bars", None)
     if eofb is not None:
         cfg_resolved.setdefault("risk", {})
         if not isinstance(cfg_resolved["risk"], dict):
             cfg_resolved["risk"] = {}
         cfg_resolved["risk"]["eof_buffer_bars"] = int(eofb)
+
+    # validity mode
+    v = overrides.get("risk.validity_mode", None)
+    if isinstance(v, str) and v.strip():
+        cfg_resolved.setdefault("risk", {})
+        if not isinstance(cfg_resolved["risk"], dict):
+            cfg_resolved["risk"] = {}
+        cfg_resolved["risk"]["validity_mode"] = v.strip()
 
 
 def _get_validity_mode(cfg: Dict[str, Any]) -> str | None:
@@ -276,6 +306,21 @@ def _get_validity_mode(cfg: Dict[str, Any]) -> str | None:
 
 
 def _extract_max_holding_bars_from_cfg(cfg: Dict[str, Any]) -> int | None:
+    """
+    IMPORTANT: for your anchor strategy, the real time-stop is:
+      strategy.params.max_hold_bars
+    This function must consider it for strict_no_eof safety.
+    """
+    # 1) strategy.params.max_hold_bars  (tu caso)
+    strat = cfg.get("strategy", {}) or {}
+    if isinstance(strat, dict):
+        params = strat.get("params", {}) or {}
+        if isinstance(params, dict):
+            v0 = _norm_int(params.get("max_hold_bars"))
+            if v0 is not None:
+                return v0
+
+    # 2) risk.guardrails.max_holding_bars (otros setups)
     risk = cfg.get("risk", {}) or {}
 
     g = risk.get("guardrails")
@@ -320,8 +365,12 @@ def _enforce_strict_no_eof_entry_safety(cfg_resolved: Dict[str, Any]) -> None:
         return
 
     eofb_eff = int(eofb or 0)
-    if eofb_eff < int(max_hold):
-        risk["eof_buffer_bars"] = int(max_hold)
+
+    # margen conservador: 12 barras = 60 minutos en M5
+    margin = 12
+    required = int(max_hold) + margin
+    if eofb_eff < required:
+        risk["eof_buffer_bars"] = required
 
 
 def _ts_to_ymd(ts: Any) -> str:
@@ -419,15 +468,6 @@ def _is_regime_fx_enabled(cfg_resolved: Dict[str, Any]) -> bool:
 
 
 def _allowed_forced_exit_reasons(cfg_resolved: Dict[str, Any]) -> set[str]:
-    """
-    Determine which FORCE_* exit reasons are allowed for this run.
-
-    Priority:
-      1) risk.allowed_forced_exit_reasons (explicit list)
-      2) inferred defaults:
-         - FORCE_MAX_HOLD if max_holding_bars enabled (>0)
-         - FORCE_REGIME_EXIT if regime_fx.enabled == true
-    """
     risk = cfg_resolved.get("risk", {}) or {}
     reasons_raw = risk.get("allowed_forced_exit_reasons", None)
 
@@ -441,7 +481,6 @@ def _allowed_forced_exit_reasons(cfg_resolved: Dict[str, Any]) -> set[str]:
     if out:
         return out
 
-    # inferred defaults
     max_hold_cfg = _extract_max_holding_bars_from_cfg(cfg_resolved)
     if max_hold_cfg is not None and int(max_hold_cfg) > 0:
         out.add("FORCE_MAX_HOLD")
@@ -453,10 +492,6 @@ def _allowed_forced_exit_reasons(cfg_resolved: Dict[str, Any]) -> set[str]:
 
 
 def _allowed_forced_exits_total(metrics: Dict[str, Any], cfg_resolved: Dict[str, Any]) -> int:
-    """
-    Sum counts of allowed FORCE_* exit reasons using metrics keys:
-      exit_reason_count__<REASON>
-    """
     allowed = _allowed_forced_exit_reasons(cfg_resolved)
     total = 0
     for r in sorted(allowed):
@@ -468,14 +503,16 @@ def _allowed_forced_exits_total(metrics: Dict[str, Any], cfg_resolved: Dict[str,
 def _compute_run_status(metrics: Dict[str, Any], cfg_resolved: Dict[str, Any]) -> Dict[str, Any]:
     forced_total = int(metrics.get("forced_exits_total", 0) or 0)
 
-    # NOTE: these keys depend on summarize_trades() output; keep existing behavior
     eof_forced = int(metrics.get("forced_exits__EOF", 0) or 0)
     eof_skipped = int(metrics.get("forced_exits__EOF_SKIPPED_BY_POLICY", 0) or 0)
 
     forced_eof_total = int(metrics.get("forced_eof_total", 0) or 0)
     eof_exits_total = int(metrics.get("eof_exits_total", 0) or 0)
 
-    invalid_eof = (eof_forced + eof_skipped + forced_eof_total + eof_exits_total) > 0
+    allowed = _allowed_forced_exit_reasons(cfg_resolved)
+    eof_present = (eof_forced + eof_skipped + forced_eof_total + eof_exits_total) > 0
+
+    invalid_eof = bool(eof_present and ("FORCE_EOF" not in allowed))
 
     allowed_forced = _allowed_forced_exits_total(metrics, cfg_resolved)
     forced_non_allowed = max(0, forced_total - allowed_forced)
@@ -531,10 +568,15 @@ def run_from_config(
     *,
     cli_overrides: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    # Keep original user cfg values for policy-sensitive keys
     policy_overrides = _capture_policy_sensitive_overrides(cfg)
 
+    # Apply execution policy overlay, but DO NOT DROP UNKNOWN KEYS
     pol_res = apply_execution_policy(cfg)
     cfg_resolved = pol_res.cfg_resolved if pol_res is not None else cfg
+
+    # CRITICAL FIX: preserve unknown keys (risk.validity_mode, risk.eof_buffer_bars, etc.)
+    cfg_resolved = _deep_merge(cfg, cfg_resolved)
 
     _apply_policy_sensitive_overrides(cfg_resolved, policy_overrides)
     _enforce_strict_no_eof_entry_safety(cfg_resolved)
@@ -554,29 +596,29 @@ def run_from_config(
     # Load + dataset registry
     df, dataset_meta, dataset_id_final = _load_bars_and_register_dataset(cfg_resolved)
 
-    # ---- Optional: Distance-to-anchor feature (deterministic) ----
+    # Optional hooks
     pip_size = float(instrument.get("pip_size", 0.0) or 0.0)
     df, dist_anchor_manifest = attach_dist_to_anchor_if_enabled(df, cfg_resolved, pip_size=pip_size)
-
-    # ---- Deterministic enrichment hooks ----
     df, shock_manifest = attach_shock_z_if_enabled(df, cfg_resolved, dataset_id=dataset_id_final)
     df, regime_fx_manifest = attach_regime_fx_if_enabled(df, cfg_resolved, dataset_id=dataset_id_final)
 
     strat_cfg = cfg_resolved["strategy"]
     strategy = make_strategy(strat_cfg["name"], strat_cfg.get("params", {}))
 
-    intents_by_bar: list[Any] = []
     context = {
         "symbol": cfg_resolved["symbol"],
         "timeframe": cfg_resolved["timeframe"],
         "instrument": instrument,
+        "pip_size": float(instrument.get("pip_size", 0.0) or 0.0),
     }
+
+    intents_by_bar: list[Any] = []
     for i in range(len(df)):
         intents_by_bar.append(strategy.on_bar(i, df, context))
 
     intent_diag = _summarize_intents(intents_by_bar, sample_max=5)
 
-    # ---- APPLY ENTRY DELAY ----
+    # Entry delay
     exe_cfg = cfg_resolved.get("execution", {}) or {}
     delay_bars = _norm_int(exe_cfg.get("entry_delay_bars"))
     if delay_bars is None:

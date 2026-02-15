@@ -1,0 +1,52 @@
+name: anchor_mr_pure_thr_8p_v1
+symbol: EURUSD
+timeframe: M5
+data_path: data/anchor_reversion_fx/data/eurusd_m5_features.csv
+
+instrument:
+  pip_size: 0.0001
+  data_source: local_csv
+
+costs:
+  commission: 0.0
+  spread_pips: 1.0
+  slippage_pips: 0.0
+
+execution:
+  fill_mode: close
+  intrabar_path: OHLC
+  intrabar_tie: sl_first
+  entry_delay_bars: 0
+
+risk:
+  force_exit_on_eof: true
+  eof_buffer_bars: 0
+
+  # MR puro => sin SL, pero con proxy para métricas R
+  allow_missing_sl: true
+  risk_proxy_price: 0.0005  # 5 pips
+
+  # Permitimos forced exits esperados por diseño del experimento
+  allowed_forced_exit_reasons:
+    - FORCE_EOF
+    - FORCE_MAX_HOLD
+
+  # Guardrail duro para que nunca existan trades eternos (ej: 288 barras = 1 día)
+  guardrails:
+    max_holding_bars: 288
+
+strategy:
+  name: AnchorReversionFXNoBracket
+  params:
+    qty: 1.0
+    anchor_col: ny_open
+    warmup_bars: 0
+
+    # Señal MR
+    entry_threshold_pips: 8
+    exit_threshold_pips: 0.5
+
+    # Time stop en la estrategia (redundante con guardrail, pero ok)
+    max_hold_bars: 288
+
+    tag: AnchorMR_Pure_8p_v1

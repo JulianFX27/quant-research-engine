@@ -12,10 +12,13 @@ class RunConfig:
     symbol: str
     timeframe: str
     data_path: str
+
     instrument: Dict[str, Any]
+    dataset_registry: Dict[str, Any]
     strategy: Dict[str, Any]
     execution: Dict[str, Any]
     costs: Dict[str, Any]
+    risk: Dict[str, Any]
 
 
 def _as_float(d: Dict[str, Any], key: str, default: Optional[float] = None) -> Optional[float]:
@@ -110,7 +113,7 @@ def validate_run_config(cfg: dict) -> None:
         raise ValueError(f"data_path not found: {cfg['data_path']}")
 
     # ---- Instrument (optional but recommended) ----
-    instrument = cfg.get("instrument", {})
+    instrument = cfg.get("instrument", {}) or {}
     if instrument is not None and not isinstance(instrument, dict):
         raise ValueError("Invalid 'instrument': must be a mapping/dict if provided")
 
@@ -144,10 +147,11 @@ def validate_run_config(cfg: dict) -> None:
     if "name" not in strat or not isinstance(strat["name"], str) or not strat["name"].strip():
         raise ValueError("Invalid strategy.name: must be a non-empty string")
 
-    params = strat.get("params", {})
+    params = strat.get("params", {}) or {}
     if params is not None and not isinstance(params, dict):
         raise ValueError("Invalid strategy.params: must be a mapping/dict if provided")
 
+    max_hold_bars = None
     if isinstance(params, dict):
         qty = _as_float(params, "qty", default=None)
         if qty is not None and qty <= 0:
@@ -175,6 +179,10 @@ def validate_run_config(cfg: dict) -> None:
             raise ValueError(f"Invalid strategy.params.sl_pips: must be > 0, got {params.get('sl_pips')!r}")
         if tp_pips is not None and tp_pips <= 0:
             raise ValueError(f"Invalid strategy.params.tp_pips: must be > 0, got {params.get('tp_pips')!r}")
+
+        max_hold_bars = _as_int(params, "max_hold_bars", default=None)
+        if max_hold_bars is not None and max_hold_bars < 0:
+            raise ValueError(f"Invalid strategy.params.max_hold_bars: must be >= 0, got {params.get('max_hold_bars')!r}")
 
     # ---- Execution ----
     exe = cfg["execution"]
@@ -253,3 +261,65 @@ def validate_run_config(cfg: dict) -> None:
         mhb = _as_int(risk, "max_holding_bars", default=0)
         if mhb is not None and mhb < 0:
             raise ValueError(f"Invalid risk.max_holding_bars: must be >= 0, got {risk.get('max_holding_bars')!r}")
+
+        # --- EOF validity policy (CRÍTICO para tu caso) ---
+        validity_mode = risk.get("validity_mode", None)
+        if validity_mode is not None:
+            if not isinstance(validity_mode, str) or not validity_mode.strip():
+                raise ValueError("Invalid risk.validity_mode: must be a non-empty string or null")
+            validity_mode = validity_mode.strip()
+            allowed = {"strict_no_eof", "warn_only", "off"}
+            if validity_mode not in allowed:
+                raise ValueError(
+                    f"Invalid risk.validity_mode: got {validity_mode!r}. Allowed: {sorted(allowed)}"
+                )
+
+        eof_buffer_bars = _as_int(risk, "eof_buffer_bars", default=0)
+        if eof_buffer_bars is None or eof_buffer_bars < 0:
+            raise ValueError(
+                f"Invalid risk.eof_buffer_bars: must be >= 0, got {risk.get('eof_buffer_bars')!r}"
+            )
+
+        force_exit_on_eof = _as_bool(risk, "force_exit_on_eof", default=True)
+        if force_exit_on_eof is None:
+            raise ValueError("Invalid risk.force_exit_on_eof: must be bool-like or null")
+
+        # Cross-check científico: si hay max_hold_bars, el buffer debe cubrirlo
+        # (si validity_mode=strict_no_eof, esto evita entradas que "no tienen horizonte")
+        if max_hold_bars is not None and max_hold_bars > 0:
+            # margen conservador: 12 barras = 60 minutos en M5 (reduce falsos EOF por edge cases)
+            margin = 12
+            required_buf = int(max_hold_bars) + margin
+            if eof_buffer_bars < required_buf and (risk.get("validity_mode") == "strict_no_eof"):
+                raise ValueError(
+                    "RISK_EOF_BUFFER_TOO_SMALL:\n"
+                    f"  risk.validity_mode=strict_no_eof requires risk.eof_buffer_bars >= max_hold_bars + margin\n"
+                    f"  got eof_buffer_bars={eof_buffer_bars}, max_hold_bars={max_hold_bars}, required>={required_buf}\n"
+                    "Fix:\n"
+                    f"  - set risk.eof_buffer_bars: {required_buf} (or higher), OR\n"
+                    "  - disable strict mode (validity_mode: warn_only/off) if you want to allow EOF-impacted samples."
+                )
+
+
+def build_run_config(cfg: dict) -> RunConfig:
+    """
+    Build a typed RunConfig WITHOUT dropping sections like 'risk'.
+    """
+    validate_run_config(cfg)
+
+    instrument = cfg.get("instrument", {}) or {}
+    dataset_registry = cfg.get("dataset_registry", {}) or {}
+    risk = cfg.get("risk", {}) or {}
+
+    return RunConfig(
+        name=str(cfg["name"]),
+        symbol=str(cfg["symbol"]),
+        timeframe=str(cfg["timeframe"]),
+        data_path=str(cfg["data_path"]),
+        instrument=dict(instrument),
+        dataset_registry=dict(dataset_registry),
+        strategy=dict(cfg["strategy"]),
+        execution=dict(cfg["execution"]),
+        costs=dict(cfg["costs"]),
+        risk=dict(risk),
+    )

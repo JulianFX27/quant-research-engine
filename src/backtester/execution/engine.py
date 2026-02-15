@@ -10,6 +10,66 @@ from backtester.core.contracts import OrderIntent
 from backtester.risk.guardrails import Guardrails
 
 
+def _extract_max_holding_bars(risk_cfg: dict) -> int:
+    """
+    Read max holding bars from the supported config paths.
+
+    Priority:
+      1) risk_cfg['guardrails_cfg']['max_holding_bars']
+      2) risk_cfg['guardrails']['max_holding_bars']
+      3) risk_cfg['max_holding_bars']  (legacy / convenience)
+    """
+    if not isinstance(risk_cfg, dict):
+        return 0
+
+    for path in (
+        ("guardrails_cfg", "max_holding_bars"),
+        ("guardrails", "max_holding_bars"),
+        ("max_holding_bars",),
+    ):
+        cur: Any = risk_cfg
+        ok = True
+        for k in path:
+            if isinstance(cur, dict) and k in cur:
+                cur = cur[k]
+            else:
+                ok = False
+                break
+        if ok and cur is not None:
+            try:
+                v = int(cur)
+                return max(0, v)
+            except Exception:
+                return 0
+
+    return 0
+
+
+def _infer_bar_minutes_from_index(index: pd.Index, max_samples: int = 2000) -> Optional[float]:
+    """
+    Robust bar-size inference from datetime-like index.
+    Uses median of positive deltas (in minutes) to ignore gaps.
+    """
+    try:
+        if index is None or len(index) < 2:
+            return None
+        # Use only first N deltas for speed
+        idx = pd.DatetimeIndex(index[: min(len(index), max_samples)])
+        deltas = idx.to_series().diff().dropna()
+        if deltas.empty:
+            return None
+        mins = (deltas.dt.total_seconds() / 60.0)
+        mins = mins[mins > 0]
+        if mins.empty:
+            return None
+        m = float(mins.median())
+        if not pd.notna(m) or m <= 0:
+            return None
+        return m
+    except Exception:
+        return None
+
+
 @dataclass
 class Trade:
     entry_time: pd.Timestamp
@@ -22,7 +82,7 @@ class Trade:
     tag: str
     exit_reason: str
 
-    # Research-grade duration field (derived from timestamps; avoids gaps artifacts)
+    # Research-grade duration field (derived from bars; avoids gaps artifacts)
     hold_minutes: float | None = None
 
     # Bar indices (critical for research: duration in TRUE bars, not time gaps)
@@ -70,6 +130,11 @@ class SimpleBarEngine:
       - risk.regime_gate_entries_enabled: bool
       - risk.regime_gate_entries_col: str (default "state_regime")
       - risk.regime_gate_entries_allowed: list[str]
+
+    NEW (strategy-driven exits):
+      - Strategy can emit OrderIntent(action="EXIT") while a position is open.
+        - fill_mode=close     => exit at current close
+        - fill_mode=next_open => exit at next bar open (no lookahead; same pattern as regime exit)
     """
 
     def __init__(self, *, costs: Dict[str, Any], exec_cfg: Dict[str, Any], risk_cfg: Optional[Dict[str, Any]] = None):
@@ -87,14 +152,17 @@ class SimpleBarEngine:
         self.force_exit_on_eof: bool = bool(risk_cfg_norm.get("force_exit_on_eof", True))
         risk_cfg_norm["force_exit_on_eof"] = self.force_exit_on_eof
 
-        # max_holding_bars normalization: 0/None => disabled
-        _mhb = risk_cfg_norm.get("max_holding_bars", None)
+        # max_holding_bars normalization (supports nested guardrails_cfg paths)
+        _mhb_int = 0
         try:
-            _mhb_int = int(_mhb) if _mhb is not None else 0
+            _mhb_int = int(_extract_max_holding_bars(risk_cfg_norm) or 0)
         except Exception:
             _mhb_int = 0
-        self.max_holding_bars: Optional[int] = _mhb_int if (_mhb_int > 0) else None
+
+        self.max_holding_bars: Optional[int] = _mhb_int if _mhb_int > 0 else None
         risk_cfg_norm["max_holding_bars"] = int(self.max_holding_bars) if self.max_holding_bars is not None else 0
+        if isinstance(risk_cfg_norm.get("guardrails_cfg"), dict) and self.max_holding_bars is not None:
+            risk_cfg_norm["guardrails_cfg"]["max_holding_bars"] = int(self.max_holding_bars)
 
         # eof_buffer_bars normalization: 0/None => disabled
         _ebb = risk_cfg_norm.get("eof_buffer_bars", 0)
@@ -121,7 +189,7 @@ class SimpleBarEngine:
         self.min_risk_price: float = _mrp_f
         risk_cfg_norm["min_risk_price"] = float(self.min_risk_price)
 
-        # --- NEW: allow time-stop strategies with no SL ---
+        # --- allow time-stop strategies with no SL ---
         self.allow_missing_sl: bool = bool(risk_cfg_norm.get("allow_missing_sl", False))
         risk_cfg_norm["allow_missing_sl"] = bool(self.allow_missing_sl)
 
@@ -250,10 +318,6 @@ class SimpleBarEngine:
         d[key] = int(d.get(key, 0)) + int(n)
 
     def _validate_sl_relation(self, *, side: str, entry_price: float, sl_price: Optional[float]) -> Tuple[bool, str]:
-        """
-        If allow_missing_sl=True, missing SL is OK (time-stop strategies).
-        Otherwise: SL must exist and be on correct side of entry.
-        """
         if sl_price is None:
             if self.allow_missing_sl:
                 return True, "OK_NO_SL"
@@ -270,12 +334,6 @@ class SimpleBarEngine:
         return True, "OK"
 
     def _validate_min_risk(self, *, entry_price: float, sl_price: Optional[float]) -> Tuple[bool, str, float]:
-        """
-        Return (ok, reason, risk_price).
-
-        - If SL exists: rp = abs(entry - sl), enforce min_risk_price if configured.
-        - If SL missing AND allow_missing_sl: require risk_proxy_price > 0.
-        """
         if sl_price is None:
             if not self.allow_missing_sl:
                 return False, "MISSING_SL", 0.0
@@ -306,6 +364,7 @@ class SimpleBarEngine:
         risk_price: Optional[float],
         entry_idx: Optional[int],
         exit_idx: Optional[int],
+        bar_minutes: Optional[float],
     ) -> Trade:
         exit_fill = self._fill_exit(float(exit_level), pos_side)
         if pos_side == "BUY":
@@ -315,12 +374,20 @@ class SimpleBarEngine:
 
         pnl = self._apply_costs(raw_pnl, pos_qty)
 
-        # Compute hold_minutes deterministically
+        # Research-grade duration:
+        # Prefer bar-based duration to avoid gaps artifacts.
         hold_m: float | None = None
-        try:
-            hold_m = float((pd.Timestamp(ts) - pd.Timestamp(entry_time)).total_seconds() / 60.0)
-        except Exception:
-            hold_m = None
+        if (entry_idx is not None) and (exit_idx is not None) and (bar_minutes is not None) and (bar_minutes > 0):
+            try:
+                hold_m = float((int(exit_idx) - int(entry_idx)) * float(bar_minutes))
+            except Exception:
+                hold_m = None
+        else:
+            # Fallback to timestamp delta
+            try:
+                hold_m = float((pd.Timestamp(ts) - pd.Timestamp(entry_time)).total_seconds() / 60.0)
+            except Exception:
+                hold_m = None
 
         return Trade(
             entry_time=entry_time,
@@ -343,6 +410,9 @@ class SimpleBarEngine:
     def run(self, df: pd.DataFrame, intents_by_bar: List[List[OrderIntent]]) -> List[Trade]:
         trades: List[Trade] = []
 
+        # Infer bar size once (robust to gaps)
+        bar_minutes = _infer_bar_minutes_from_index(df.index)
+
         pos_side: Optional[str] = None
         pos_qty: float = 0.0
         entry_price: float = 0.0
@@ -359,7 +429,6 @@ class SimpleBarEngine:
         pending_intent: Optional[OrderIntent] = None
         pending_tag: str = ""
 
-        # NEW: pending forced exit at next bar open (for next_open semantics)
         pending_exit_reason: Optional[str] = None
 
         current_day: Optional[str] = None
@@ -413,10 +482,13 @@ class SimpleBarEngine:
 
             o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
 
-            # ------------------------------------------------------------
-            # NEW: apply pending forced exit at this bar OPEN (next_open semantics)
-            # ------------------------------------------------------------
-            if (pos_side is not None) and (entry_time is not None) and (entry_index is not None) and (pending_exit_reason is not None):
+            # Apply pending exit at this bar OPEN (next_open semantics)
+            if (
+                (pos_side is not None)
+                and (entry_time is not None)
+                and (entry_index is not None)
+                and (pending_exit_reason is not None)
+            ):
                 trade = self._close_position(
                     ts=ts,
                     exit_level=float(o),
@@ -431,6 +503,7 @@ class SimpleBarEngine:
                     risk_price=pos_risk_price,
                     entry_idx=int(entry_index),
                     exit_idx=int(i),
+                    bar_minutes=bar_minutes,
                 )
                 trades.append(trade)
 
@@ -459,7 +532,6 @@ class SimpleBarEngine:
                 pos_tp_price = None
                 pos_risk_price = None
                 pending_exit_reason = None
-            # ------------------------------------------------------------
 
             # Fill pending entry at this bar open
             if pos_side is None and pending_intent is not None:
@@ -517,12 +589,113 @@ class SimpleBarEngine:
             if pos_side is not None:
                 time_in_position_bars += 1
 
+            # ---- Strategy-driven EXIT intents ----
+            if pos_side is not None and pending_exit_reason is None:
+                intents_here = intents_by_bar[i] if i < len(intents_by_bar) else []
+                if intents_here:
+                    for it in intents_here:
+                        if str(getattr(it, "action", "ENTER")).upper() == "EXIT":
+                            reason = str(getattr(it, "exit_reason", "") or "").strip() or "SIGNAL_EXIT"
+                            if self.fill_mode == "next_open":
+                                if i < n_bars - 1:
+                                    pending_exit_reason = reason
+                                else:
+                                    trade = self._close_position(
+                                        ts=ts,
+                                        exit_level=float(c),
+                                        exit_reason=reason,
+                                        pos_side=pos_side,
+                                        pos_qty=pos_qty,
+                                        entry_price=float(entry_price),
+                                        entry_time=entry_time,
+                                        tag=tag,
+                                        sl_price=pos_sl_price,
+                                        tp_price=pos_tp_price,
+                                        risk_price=pos_risk_price,
+                                        entry_idx=int(entry_index) if entry_index is not None else None,
+                                        exit_idx=int(i),
+                                        bar_minutes=bar_minutes,
+                                    )
+                                    trades.append(trade)
+                                    self._bump(forced_exits, f"{reason}_FALLBACK_CLOSE")
+
+                                    r_mult = self._safe_r_multiple(trade.pnl, trade.risk_price, trade.qty)
+                                    if r_mult is not None:
+                                        realized_R_today += float(r_mult)
+
+                                    if (self.max_daily_loss_R is not None) and (
+                                        realized_R_today <= -abs(float(self.max_daily_loss_R))
+                                    ):
+                                        stopped_today = True
+
+                                    if self.cooldown_bars > 0:
+                                        cooldown_until_index = max(cooldown_until_index, i + self.cooldown_bars + 1)
+
+                                    pos_side = None
+                                    pos_qty = 0.0
+                                    entry_price = 0.0
+                                    entry_time = None
+                                    entry_index = None
+                                    sl = None
+                                    tp = None
+                                    tag = ""
+                                    pos_sl_price = None
+                                    pos_tp_price = None
+                                    pos_risk_price = None
+                                    pending_exit_reason = None
+                            else:
+                                trade = self._close_position(
+                                    ts=ts,
+                                    exit_level=float(c),
+                                    exit_reason=reason,
+                                    pos_side=pos_side,
+                                    pos_qty=pos_qty,
+                                    entry_price=float(entry_price),
+                                    entry_time=entry_time,
+                                    tag=tag,
+                                    sl_price=pos_sl_price,
+                                    tp_price=pos_tp_price,
+                                    risk_price=pos_risk_price,
+                                    entry_idx=int(entry_index) if entry_index is not None else None,
+                                    exit_idx=int(i),
+                                    bar_minutes=bar_minutes,
+                                )
+                                trades.append(trade)
+                                self._bump(forced_exits, reason)
+
+                                r_mult = self._safe_r_multiple(trade.pnl, trade.risk_price, trade.qty)
+                                if r_mult is not None:
+                                    realized_R_today += float(r_mult)
+
+                                if (self.max_daily_loss_R is not None) and (
+                                    realized_R_today <= -abs(float(self.max_daily_loss_R))
+                                ):
+                                    stopped_today = True
+
+                                if self.cooldown_bars > 0:
+                                    cooldown_until_index = max(cooldown_until_index, i + self.cooldown_bars + 1)
+
+                                pos_side = None
+                                pos_qty = 0.0
+                                entry_price = 0.0
+                                entry_time = None
+                                entry_index = None
+                                sl = None
+                                tp = None
+                                tag = ""
+                                pos_sl_price = None
+                                pos_tp_price = None
+                                pos_risk_price = None
+                                pending_exit_reason = None
+
+                            break
+            # ---------------------------------------------------------------------------
+
             # Manage existing position
             if pos_side is not None and entry_time is not None and entry_index is not None:
                 exit_reason: Optional[str] = None
                 exit_level: Optional[float] = None
 
-                # SL/TP intrabar
                 if sl is not None or tp is not None:
                     if sl is not None and tp is not None:
                         reason = self._decide_exit_reason(o, h, l, c, pos_side, float(sl), float(tp))
@@ -537,7 +710,6 @@ class SimpleBarEngine:
                         if l <= float(tp) <= h:
                             exit_reason, exit_level = "TP", float(tp)
 
-                # Tie-break fallback (defensive)
                 if exit_reason is None and sl is not None and tp is not None:
                     hit_sl = l <= float(sl) <= h
                     hit_tp = l <= float(tp) <= h
@@ -547,8 +719,6 @@ class SimpleBarEngine:
                         else:
                             exit_reason, exit_level = "SL", float(sl)
 
-                # NEW: FORCE_REGIME_EXIT (no lookahead)
-                # Decision uses CURRENT bar regime value; exit occurs at NEXT bar open if fill_mode=next_open.
                 if exit_reason is None and self.regime_exit_enabled and len(self.regime_exit_allowed) > 0:
                     if self.regime_exit_col in df.columns:
                         cur_reg = row.get(self.regime_exit_col, None)
@@ -558,16 +728,13 @@ class SimpleBarEngine:
                                 if i < n_bars - 1:
                                     pending_exit_reason = "FORCE_REGIME_EXIT"
                                 else:
-                                    # No next open; fallback to close
                                     exit_reason, exit_level = "FORCE_REGIME_EXIT", float(c)
                                     self._bump(forced_exits, "FORCE_REGIME_EXIT_FALLBACK_CLOSE")
                             else:
                                 exit_reason, exit_level = "FORCE_REGIME_EXIT", float(c)
                     else:
-                        # Config enabled but column missing => treat as config issue (do not crash engine)
                         self._bump(forced_exits, "FORCE_REGIME_EXIT_MISSING_COL")
 
-                # FORCE_MAX_HOLD only if enabled (>0)
                 if exit_reason is None and pending_exit_reason is None and (self.max_holding_bars is not None):
                     holding_bars = i - int(entry_index)
                     force, force_reason = self.guardrails.should_force_exit(holding_bars=holding_bars)
@@ -594,6 +761,7 @@ class SimpleBarEngine:
                         risk_price=pos_risk_price,
                         entry_idx=int(entry_index),
                         exit_idx=int(i),
+                        bar_minutes=bar_minutes,
                     )
                     trades.append(trade)
 
@@ -607,7 +775,6 @@ class SimpleBarEngine:
                     if self.cooldown_bars > 0:
                         cooldown_until_index = max(cooldown_until_index, i + self.cooldown_bars + 1)
 
-                    # Reset position
                     pos_side = None
                     pos_qty = 0.0
                     entry_price = 0.0
@@ -625,7 +792,14 @@ class SimpleBarEngine:
             if pos_side is None and pending_intent is None:
                 intents = intents_by_bar[i] if i < len(intents_by_bar) else []
                 if intents:
-                    intent = intents[0]
+                    intent = None
+                    for cand in intents:
+                        if str(getattr(cand, "action", "ENTER")).upper() == "ENTER":
+                            intent = cand
+                            break
+                    if intent is None:
+                        continue
+
                     attempted_entries += 1
 
                     blocked = False
@@ -646,7 +820,6 @@ class SimpleBarEngine:
                         blocked = True
                         blocked_reason = "COOLDOWN"
 
-                    # ---- Guardrails v2 + EOF buffer gating ----
                     if not blocked:
                         active_positions = 0
 
@@ -663,7 +836,6 @@ class SimpleBarEngine:
                             blocked_reason = "V2_by_eof_buffer"
                             self._bump(blocked_v2_by_reason, "by_eof_buffer")
 
-                        # NEW: regime gating of entries (no lookahead beyond chosen fill_index)
                         if (not blocked) and self.regime_gate_entries_enabled and len(self.regime_gate_entries_allowed) > 0:
                             col = self.regime_gate_entries_col
                             if col in df.columns and 0 <= fill_index < n_bars:
@@ -708,7 +880,6 @@ class SimpleBarEngine:
                         self._bump(blocked_by_reason, blocked_reason or "UNKNOWN")
                         continue
 
-                    # Proceed with entry
                     if self.fill_mode == "next_open":
                         if i < n_bars - 1:
                             pending_intent = intent
@@ -763,12 +934,10 @@ class SimpleBarEngine:
                         tag = intent.tag
                         entries_today += 1
 
-        # EOF: pending intent never filled
         if pending_intent is not None:
             dropped_entries_total += 1
             self._bump(dropped_entries_by_reason, "PENDING_INTENT_AT_EOF")
 
-        # EOF: open position handling (ARCH A/B)
         if (pos_side is not None) and (entry_time is not None) and (last_bar_ts is not None) and (last_bar_close is not None):
             eof_idx = n_bars - 1 if n_bars > 0 else None
             if self.force_exit_on_eof:
@@ -786,6 +955,7 @@ class SimpleBarEngine:
                     risk_price=pos_risk_price,
                     entry_idx=int(entry_index) if entry_index is not None else None,
                     exit_idx=int(eof_idx) if eof_idx is not None else None,
+                    bar_minutes=bar_minutes,
                 )
                 trades.append(trade)
                 self._bump(forced_exits, "EOF")

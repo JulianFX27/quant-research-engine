@@ -116,11 +116,10 @@ def _get_hold_minutes(t: Any) -> float | None:
         return None
 
 
-def _is_time_stop_normal_exit(t: Any) -> bool:
+def _is_time_stop_exit(t: Any) -> bool:
     """
-    Time-stop semantics:
-      If exit_reason == FORCE_MAX_HOLD AND strategy did not use SL/TP in price,
-      then this is the *normal* exit (not a "forced/invalid" artifact).
+    Identify time-stop exits (FORCE_MAX_HOLD used as the *intended* exit rule),
+    i.e. no price-based SL/TP.
     """
     er = getattr(t, "exit_reason", None)
     if er != "FORCE_MAX_HOLD":
@@ -128,6 +127,45 @@ def _is_time_stop_normal_exit(t: Any) -> bool:
     slp = getattr(t, "sl_price", None)
     tpp = getattr(t, "tp_price", None)
     return (slp is None) and (tpp is None)
+
+
+def _is_forced_exit_reason(er: str) -> bool:
+    """
+    Canonical forced exit definition for metrics:
+      - Any reason starting with "FORCE_" is forced.
+      - "EOF" and "FORCE_EOF" are forced.
+    """
+    if not er:
+        return False
+    if er == "EOF":
+        return True
+    if er == "FORCE_EOF":
+        return True
+    if er.startswith("FORCE_"):
+        return True
+    return False
+
+
+def _r_multiple(pnl: float, risk_price: float, qty: float | None) -> float | None:
+    """
+    Formal R contract:
+      R = pnl / (risk_price * abs(qty))
+
+    If qty is missing or 0, fallback to legacy pnl/risk_price (but we count it).
+    """
+    if not math.isfinite(pnl):
+        return None
+    if (risk_price is None) or (not math.isfinite(risk_price)) or (risk_price <= RISK_EPS):
+        return None
+
+    if qty is None or (not math.isfinite(float(qty))) or float(qty) == 0.0:
+        # legacy fallback
+        return float(pnl) / float(risk_price)
+
+    denom = float(risk_price) * abs(float(qty))
+    if denom <= 0 or (not math.isfinite(denom)):
+        return None
+    return float(pnl) / denom
 
 
 def summarize_trades(trades: Iterable[Any]) -> Dict[str, Any]:
@@ -140,13 +178,8 @@ def summarize_trades(trades: Iterable[Any]) -> Dict[str, Any]:
       - hold_minutes (optional float)
       - exit_reason (optional str)
       - risk_price (optional float): risk in price units (proxy allowed)
-      - sl_price/tp_price optional (used only for time-stop reclassification)
-
-    NOTE:
-      - R metrics here intentionally use pnl/risk_price (legacy behavior).
-      - If you want R to be *strictly* pnl/(risk_price*abs(qty)), you can extend
-        summarize_trades similarly to trades_to_dicts. For now we keep your metrics
-        output stable; the CSV will have correct R.
+      - qty (optional float): used for formal R
+      - sl_price/tp_price optional (used only for time-stop classification)
     """
     pnl_list: List[float] = []
     win_list: List[float] = []
@@ -154,7 +187,7 @@ def summarize_trades(trades: Iterable[Any]) -> Dict[str, Any]:
     hold_minutes: List[float] = []
     exit_reason_counts: Dict[str, int] = {}
 
-    # R-space lists
+    # R-space lists (formal R where possible; legacy fallback if qty missing/0)
     R_list: List[float] = []
     R_win: List[float] = []
     R_loss: List[float] = []
@@ -164,14 +197,14 @@ def summarize_trades(trades: Iterable[Any]) -> Dict[str, Any]:
     n_trades_bad_risk = 0
     n_trades_tiny_risk = 0
     n_trades_extreme_R = 0
+    n_trades_R_qty_missing_or_zero = 0
     R_max_abs_seen_raw: float | None = None
 
-    # forced exit accounting
-    # NOTE: FORCE_MAX_HOLD is conditionally reclassified as normal exit for time-stop strategies.
-    forced_eof_reasons = {"FORCE_EOF", "EOF"}
-    forced_exits_total = 0
-    forced_eof_total = 0
-    eof_exits_total = 0
+    # Exit accounting (make it unambiguous)
+    forced_exits_total = 0  # includes FORCE_* and EOF/FORCE_EOF
+    forced_eof_total = 0    # strictly FORCE_EOF
+    eof_exits_total = 0     # EOF + FORCE_EOF
+    time_stop_exits_total = 0  # FORCE_MAX_HOLD with no SL/TP
     non_forced_exits_total = 0
 
     # Build equity curve in pnl-space for DD
@@ -197,25 +230,25 @@ def summarize_trades(trades: Iterable[Any]) -> Dict[str, Any]:
             hold_minutes.append(hm)
 
         er = getattr(t, "exit_reason", None)
-        if isinstance(er, str) and er:
-            exit_reason_counts[er] = exit_reason_counts.get(er, 0) + 1
+        er_s = er if isinstance(er, str) else ""
+        if er_s:
+            exit_reason_counts[er_s] = exit_reason_counts.get(er_s, 0) + 1
 
-            # Time-stop: treat FORCE_MAX_HOLD as normal exit when no SL/TP in price
-            if _is_time_stop_normal_exit(t):
-                non_forced_exits_total += 1
+            if _is_time_stop_exit(t):
+                time_stop_exits_total += 1
+
+            if _is_forced_exit_reason(er_s):
+                forced_exits_total += 1
+                if er_s == "FORCE_EOF":
+                    forced_eof_total += 1
+                if er_s in {"EOF", "FORCE_EOF"}:
+                    eof_exits_total += 1
             else:
-                if er in forced_eof_reasons or er.startswith("FORCE_"):
-                    forced_exits_total += 1
-                    if er == "FORCE_EOF":
-                        forced_eof_total += 1
-                    if er in {"EOF", "FORCE_EOF"}:
-                        eof_exits_total += 1
-                else:
-                    non_forced_exits_total += 1
+                non_forced_exits_total += 1
         else:
             non_forced_exits_total += 1
 
-        # --- R-space (legacy) ---
+        # --- R-space ---
         rp = _safe_float(getattr(t, "risk_price", None), default=None)
         if rp is None:
             continue
@@ -230,8 +263,12 @@ def summarize_trades(trades: Iterable[Any]) -> Dict[str, Any]:
             n_trades_tiny_risk += 1
             continue
 
-        R_raw = pnl / rp
-        if not math.isfinite(R_raw):
+        qty = _safe_float(getattr(t, "qty", None), default=None)
+        if qty is None or qty == 0.0:
+            n_trades_R_qty_missing_or_zero += 1
+
+        R_raw = _r_multiple(pnl=pnl, risk_price=rp, qty=qty)
+        if R_raw is None or (not math.isfinite(R_raw)):
             n_trades_bad_risk += 1
             continue
 
@@ -330,18 +367,23 @@ def summarize_trades(trades: Iterable[Any]) -> Dict[str, Any]:
         "min_hold_minutes": min_hold,
         "max_hold_minutes": max_hold,
 
+        # Exit accounting (now consistent with exit_reason_count__)
         "forced_exits_total": int(forced_exits_total),
         "forced_eof_total": int(forced_eof_total),
         "eof_exits_total": int(eof_exits_total),
+        "time_stop_exits_total": int(time_stop_exits_total),
         "non_forced_exits_total": int(non_forced_exits_total),
 
+        # R diagnostics
         "n_trades_with_risk": int(n_trades_with_risk),
         "n_trades_bad_risk": int(n_trades_bad_risk),
         "n_trades_tiny_risk": int(n_trades_tiny_risk),
         "n_trades_extreme_R": int(n_trades_extreme_R),
+        "n_trades_R_qty_missing_or_zero": int(n_trades_R_qty_missing_or_zero),
         "R_cap_abs": float(R_CAP_ABS),
         "R_max_abs_seen_raw": R_max_abs_seen_raw,
 
+        # R metrics
         "expectancy_R": expectancy_R,
         "avg_R": avg_R,
         "median_R": median_R,
@@ -378,7 +420,7 @@ def trades_to_dicts(trades: Iterable[Any]) -> List[Dict[str, Any]]:
         d["entry_idx"] = getattr(t, "entry_idx", None)
         d["exit_idx"] = getattr(t, "exit_idx", None)
 
-        # ---- NEW: audit columns ----
+        # ---- audit columns ----
         d["side"] = getattr(t, "side", None)
         qty = _safe_float(getattr(t, "qty", None), default=None)
         d["qty"] = qty
