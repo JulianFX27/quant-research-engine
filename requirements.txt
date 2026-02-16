@@ -1,0 +1,13 @@
+-e git+ssh://git@github.com/JulianFX27/quant-research-engine.git@d34626b862e8350bad7a5a489ae409cfbdbea150#egg=backtester
+iniconfig==2.3.0
+joblib==1.5.3
+numpy==2.4.1
+packaging==26.0
+pandas==3.0.0
+pluggy==1.6.0
+pyarrow==23.0.0
+Pygments==2.19.2
+pytest==9.0.2
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+six==1.17.0
