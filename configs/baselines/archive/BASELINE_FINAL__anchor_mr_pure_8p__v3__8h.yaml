@@ -1,0 +1,47 @@
+name: anchor_mr_pure_thr_8p__realistic_v1__gated_policy_v3
+symbol: EURUSD
+timeframe: M5
+data_path: data/anchor_reversion_fx/data/eurusd_m5_features.csv
+
+instrument:
+  pip_size: 0.0001
+  data_source: local_csv
+
+costs:
+  commission: 0.0
+  spread_pips: 1.0
+  slippage_pips: 0.2
+
+execution:
+  fill_mode: next_open
+  intrabar_path: OHLC
+  intrabar_tie: sl_first
+  entry_delay_bars: 0
+
+risk:
+  validity_mode: strict_no_eof
+  force_exit_on_eof: true
+  eof_buffer_bars: 300
+  allow_missing_sl: true
+  risk_proxy_price: 0.0005
+  allowed_forced_exit_reasons:
+    - FORCE_MAX_HOLD
+  guardrails_cfg:
+    max_holding_bars: 96
+
+strategy:
+  name: AnchorReversionFXNoBracket
+  params:
+    qty: 1.0
+    anchor_col: ny_open
+    warmup_bars: 0
+    entry_threshold_pips: 8
+    exit_threshold_pips: 0.3
+    max_hold_bars: 96
+    tag: AnchorMR_Pure_8p__Realistic_v1
+
+# NEW: gating policy (aplicación fuera de la estrategia)
+policy_gate:
+  policy_path: results/research/strategy_anchor_mr_pure_8p/diagnostics/_SNAPSHOT__policy_gate_v3_train_le_2022.yaml
+  features_path: data/anchor_reversion_fx/data/eurusd_m5_features.csv
+  time_bucket_min: 30
