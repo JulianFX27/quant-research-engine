@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -85,6 +86,29 @@ def _validate_hhmm_utc(s: str, *, field: str) -> None:
         raise ValueError(f"Invalid {field}: out of range, got {s!r}")
 
 
+def _parse_iso_utc(s: str, *, field: str) -> datetime:
+    """
+    Strict-ish ISO parser:
+      - accepts 'Z' suffix
+      - accepts offset like +00:00
+      - if naive, assumes UTC (but makes it explicit)
+    """
+    if not isinstance(s, str) or not s.strip():
+        raise ValueError(f"Invalid {field}: must be a non-empty ISO string")
+    raw = s.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except Exception as e:
+        raise ValueError(
+            f"Invalid {field}: must be ISO-8601 (e.g. 2023-01-01T00:00:00Z), got {s!r}"
+        ) from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def validate_run_config(cfg: dict) -> None:
     if not isinstance(cfg, dict):
         raise ValueError(f"Run config must be a dict, got {type(cfg).__name__}")
@@ -141,6 +165,29 @@ def validate_run_config(cfg: dict) -> None:
                 "DATASET_ID_OVERRIDE_REASON_REQUIRED: override requested but override_reason is empty.\n"
                 "Fix: set dataset_registry.override_reason to a non-empty string."
             )
+
+    # ---- Dataset slice (optional) ----
+    ds_slice = cfg.get("dataset_slice", None)
+    if ds_slice is not None:
+        if not isinstance(ds_slice, dict):
+            raise ValueError("Invalid 'dataset_slice': must be a mapping/dict if provided")
+
+        s = ds_slice.get("start_utc", None)
+        e = ds_slice.get("end_utc", None)
+
+        if s is not None:
+            _parse_iso_utc(str(s), field="dataset_slice.start_utc")
+        if e is not None:
+            _parse_iso_utc(str(e), field="dataset_slice.end_utc")
+
+        if s is not None and e is not None:
+            sdt = _parse_iso_utc(str(s), field="dataset_slice.start_utc")
+            edt = _parse_iso_utc(str(e), field="dataset_slice.end_utc")
+            if edt <= sdt:
+                raise ValueError(
+                    "Invalid dataset_slice: end_utc must be strictly after start_utc.\n"
+                    f"start_utc={sdt.isoformat()} end_utc={edt.isoformat()}"
+                )
 
     # ---- Strategy ----
     strat = cfg["strategy"]
@@ -262,7 +309,7 @@ def validate_run_config(cfg: dict) -> None:
         if mhb is not None and mhb < 0:
             raise ValueError(f"Invalid risk.max_holding_bars: must be >= 0, got {risk.get('max_holding_bars')!r}")
 
-        # --- EOF validity policy (CRÍTICO para tu caso) ---
+        # --- EOF validity policy ---
         validity_mode = risk.get("validity_mode", None)
         if validity_mode is not None:
             if not isinstance(validity_mode, str) or not validity_mode.strip():
@@ -284,11 +331,9 @@ def validate_run_config(cfg: dict) -> None:
         if force_exit_on_eof is None:
             raise ValueError("Invalid risk.force_exit_on_eof: must be bool-like or null")
 
-        # Cross-check científico: si hay max_hold_bars, el buffer debe cubrirlo
-        # (si validity_mode=strict_no_eof, esto evita entradas que "no tienen horizonte")
+        # Cross-check: si hay max_hold_bars, el buffer debe cubrirlo en strict_no_eof
         if max_hold_bars is not None and max_hold_bars > 0:
-            # margen conservador: 12 barras = 60 minutos en M5 (reduce falsos EOF por edge cases)
-            margin = 12
+            margin = 12  # 12 barras = 60 min en M5
             required_buf = int(max_hold_bars) + margin
             if eof_buffer_bars < required_buf and (risk.get("validity_mode") == "strict_no_eof"):
                 raise ValueError(

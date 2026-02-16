@@ -1,4 +1,3 @@
-# src/backtester/orchestrator/run.py
 from __future__ import annotations
 
 import hashlib
@@ -12,7 +11,6 @@ from typing import Any, Dict, Tuple
 import pandas as pd
 import yaml
 
-from backtester.orchestrator.dist_to_anchor_hook import attach_dist_to_anchor_if_enabled
 from backtester.core.config import validate_run_config
 from backtester.data.dataset_fingerprint import build_dataset_id
 from backtester.data.dataset_registry import register_or_validate_dataset
@@ -20,10 +18,14 @@ from backtester.data.loader import load_bars_csv
 from backtester.execution.engine import SimpleBarEngine
 from backtester.execution.policies import apply_execution_policy
 from backtester.metrics.basic import summarize_trades, trades_to_dicts
+from backtester.orchestrator.dist_to_anchor_hook import attach_dist_to_anchor_if_enabled
 from backtester.orchestrator.entry_delay import apply_entry_delay
 from backtester.orchestrator.regime_fx_hook import attach_regime_fx_if_enabled
 from backtester.orchestrator.shock_z_hook import attach_shock_z_if_enabled
 from backtester.strategies.registry import make_strategy
+
+# NEW: policy gate (your implementation)
+from backtester.policies.policy_gate import PolicyGate, PolicyGateConfig
 
 
 # ----------------------------
@@ -260,10 +262,10 @@ def _norm_int(x: Any) -> int | None:
     except Exception:
         return None
 
+
 def _capture_policy_sensitive_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     risk = cfg.get("risk", {}) or {}
 
-    # validity_mode puede estar en top-level o dentro de risk (tu YAML lo usa dentro de risk)
     v = None
     if isinstance(cfg.get("validity_mode"), str) and str(cfg.get("validity_mode")).strip():
         v = str(cfg.get("validity_mode")).strip()
@@ -277,7 +279,6 @@ def _capture_policy_sensitive_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _apply_policy_sensitive_overrides(cfg_resolved: Dict[str, Any], overrides: Dict[str, Any]) -> None:
-    # eof buffer
     eofb = overrides.get("risk.eof_buffer_bars", None)
     if eofb is not None:
         cfg_resolved.setdefault("risk", {})
@@ -285,7 +286,6 @@ def _apply_policy_sensitive_overrides(cfg_resolved: Dict[str, Any], overrides: D
             cfg_resolved["risk"] = {}
         cfg_resolved["risk"]["eof_buffer_bars"] = int(eofb)
 
-    # validity mode
     v = overrides.get("risk.validity_mode", None)
     if isinstance(v, str) and v.strip():
         cfg_resolved.setdefault("risk", {})
@@ -309,9 +309,7 @@ def _extract_max_holding_bars_from_cfg(cfg: Dict[str, Any]) -> int | None:
     """
     IMPORTANT: for your anchor strategy, the real time-stop is:
       strategy.params.max_hold_bars
-    This function must consider it for strict_no_eof safety.
     """
-    # 1) strategy.params.max_hold_bars  (tu caso)
     strat = cfg.get("strategy", {}) or {}
     if isinstance(strat, dict):
         params = strat.get("params", {}) or {}
@@ -320,7 +318,6 @@ def _extract_max_holding_bars_from_cfg(cfg: Dict[str, Any]) -> int | None:
             if v0 is not None:
                 return v0
 
-    # 2) risk.guardrails.max_holding_bars (otros setups)
     risk = cfg.get("risk", {}) or {}
 
     g = risk.get("guardrails")
@@ -366,7 +363,7 @@ def _enforce_strict_no_eof_entry_safety(cfg_resolved: Dict[str, Any]) -> None:
 
     eofb_eff = int(eofb or 0)
 
-    # margen conservador: 12 barras = 60 minutos en M5
+    # safety margin in bars to prevent accidental EOF interactions
     margin = 12
     required = int(max_hold) + margin
     if eofb_eff < required:
@@ -384,7 +381,71 @@ def _ts_to_ymd(ts: Any) -> str:
         return s
 
 
-def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, Any, str]:
+# ----------------------------
+# Dataset slicing (Option A)
+# ----------------------------
+
+def _parse_iso_utc_any(x: Any) -> pd.Timestamp | None:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return pd.to_datetime(s, utc=True, errors="raise")
+    except Exception:
+        return None
+
+
+def _apply_dataset_slice(df: pd.DataFrame, cfg: Dict[str, Any]) -> tuple[pd.DataFrame, Dict[str, Any] | None]:
+    ds = cfg.get("dataset_slice", None)
+    if not isinstance(ds, dict) or not ds:
+        return df, None
+
+    start = _parse_iso_utc_any(ds.get("start_utc"))
+    end = _parse_iso_utc_any(ds.get("end_utc"))
+
+    if start is None and end is None:
+        return df, None
+
+    idx = df.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        raise ValueError("DATASET_SLICE_REQUIRES_DATETIME_INDEX: df.index must be DatetimeIndex(UTC)")
+
+    mask = pd.Series(True, index=df.index)
+    if start is not None:
+        mask &= (df.index >= start)
+    if end is not None:
+        mask &= (df.index <= end)
+
+    out = df.loc[mask.values].copy()
+    manifest = {
+        "start_utc": (start.isoformat() if start is not None else None),
+        "end_utc": (end.isoformat() if end is not None else None),
+        "rows_before": int(len(df)),
+        "rows_after": int(len(out)),
+    }
+
+    if len(out) == 0:
+        raise ValueError(f"DATASET_SLICE_EMPTY: slice produced 0 rows. slice={manifest}")
+
+    return out, manifest
+
+
+def _slice_fingerprint_short(df: pd.DataFrame) -> str:
+    """
+    Fingerprint derivado del slice (no del archivo).
+    Determinista: hash del contenido serializado en CSV (incluye índice como columna).
+    """
+    tmp = df.copy()
+    tmp.insert(0, "__time__", tmp.index.astype("datetime64[ns, UTC]").astype(str))
+    b = tmp.to_csv(index=False).encode("utf-8")
+    return hashlib.sha256(b).hexdigest()[:8]
+
+
+def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, Any, str, Dict[str, Any] | None, str | None]:
     instrument = cfg.get("instrument", {}) or {}
     symbol = str(cfg.get("symbol") or "UNKNOWN")
     timeframe = str(cfg.get("timeframe") or "UNKNOWN")
@@ -413,8 +474,13 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
         keep_extra_cols=True,
     )
 
-    start_ymd = _ts_to_ymd(dataset_meta.start_ts)
-    end_ymd = _ts_to_ymd(dataset_meta.end_ts)
+    # Apply dataset slice (optional)
+    df, slice_manifest = _apply_dataset_slice(df, cfg)
+    slice_fp8 = _slice_fingerprint_short(df) if slice_manifest else None
+
+    # recomputar start/end basados en df realmente usado
+    start_ymd = _ts_to_ymd(df.index.min())
+    end_ymd = _ts_to_ymd(df.index.max())
 
     dataset_id_default = build_dataset_id(
         instrument=symbol,
@@ -429,6 +495,17 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
 
     dataset_meta_final = replace(dataset_meta, dataset_id=dataset_id_final)
 
+    # actualizar metadata a lo usado realmente (sin tocar file_sha, etc.)
+    try:
+        dataset_meta_final = replace(
+            dataset_meta_final,
+            rows=int(len(df)),
+            start_ts=str(pd.to_datetime(df.index.min(), utc=True).isoformat()),
+            end_ts=str(pd.to_datetime(df.index.max(), utc=True).isoformat()),
+        )
+    except Exception:
+        pass
+
     register_or_validate_dataset(
         dataset_meta_final,
         registry_dir=registry_dir,
@@ -437,7 +514,7 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
         append_match_event=append_match_event,
     )
 
-    return df, dataset_meta_final, dataset_id_final
+    return df, dataset_meta_final, dataset_id_final, slice_manifest, slice_fp8
 
 
 def _flatten_entry_delay_into_metrics(metrics: Dict[str, Any], entry_delay_report: Any | None) -> None:
@@ -562,6 +639,77 @@ def _summarize_intents(intents_by_bar: list[Any], *, sample_max: int = 5) -> Dic
     }
 
 
+# ----------------------------
+# Policy gate wiring (your PolicyGate API)
+# ----------------------------
+
+def _apply_policy_gate_to_intents(
+    intents_by_bar: list[Any],
+    cfg_resolved: Dict[str, Any],
+) -> tuple[list[Any], Dict[str, Any] | None]:
+    """
+    Apply PolicyGate by BAR INDEX using PolicyGate.evaluate_entry_idx(i).
+
+    We gate bars where intent is non-empty (i.e., strategy attempted something).
+    This is intentionally conservative and matches how your diagnostics are currently tracked.
+    """
+    pg = cfg_resolved.get("policy_gate", None)
+    if not isinstance(pg, dict) or not pg:
+        return intents_by_bar, None
+
+    enabled = pg.get("enabled", True)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() not in ("false", "0", "no", "n")
+    if not bool(enabled):
+        return intents_by_bar, {"enabled": False}
+
+    policy_path = pg.get("policy_path")
+    features_path = pg.get("features_path")
+    tbm = pg.get("time_bucket_min", 30)
+
+    if not isinstance(policy_path, str) or not policy_path.strip():
+        raise ValueError("policy_gate.policy_path is required and must be a non-empty string")
+    if not isinstance(features_path, str) or not features_path.strip():
+        raise ValueError("policy_gate.features_path is required and must be a non-empty string")
+
+    gate = PolicyGate(PolicyGateConfig(
+        policy_path=str(policy_path),
+        features_path=str(features_path),
+        time_bucket_min=int(tbm or 30),
+    ))
+
+    attempted = 0
+    blocked = 0
+    blocked_unique_bars = 0
+
+    out = list(intents_by_bar)
+    for i, it in enumerate(intents_by_bar):
+        if _intent_is_empty(it):
+            continue
+
+        attempted += 1
+        ok = gate.evaluate_entry_idx(int(i))
+        if not ok:
+            # drop the intent for this bar
+            out[i] = None
+            blocked += 1
+            blocked_unique_bars += 1
+
+    stats = gate.stats()
+    report = {
+        "enabled": True,
+        "policy_id": stats.get("policy_id"),
+        "policy_path": stats.get("policy_path"),
+        "features_path": stats.get("features_path"),
+        "time_bucket_min": int(tbm or 30),
+        "attempted_entries": int(attempted),
+        "blocked_total": int(blocked),
+        "blocked_unique_bars": int(blocked_unique_bars),
+        "stats": stats,
+    }
+    return out, report
+
+
 def run_from_config(
     cfg: Dict[str, Any],
     out_dir: str | Path,
@@ -575,7 +723,7 @@ def run_from_config(
     pol_res = apply_execution_policy(cfg)
     cfg_resolved = pol_res.cfg_resolved if pol_res is not None else cfg
 
-    # CRITICAL FIX: preserve unknown keys (risk.validity_mode, risk.eof_buffer_bars, etc.)
+    # CRITICAL FIX: preserve unknown keys (risk.validity_mode, risk.eof_buffer_bars, dataset_slice, policy_gate, etc.)
     cfg_resolved = _deep_merge(cfg, cfg_resolved)
 
     _apply_policy_sensitive_overrides(cfg_resolved, policy_overrides)
@@ -593,8 +741,8 @@ def run_from_config(
     started_at_utc = datetime.now(timezone.utc).isoformat()
     instrument = cfg_resolved.get("instrument", {}) or {}
 
-    # Load + dataset registry
-    df, dataset_meta, dataset_id_final = _load_bars_and_register_dataset(cfg_resolved)
+    # Load + dataset registry (+ optional slice)
+    df, dataset_meta, dataset_id_final, dataset_slice_manifest, dataset_slice_fp8 = _load_bars_and_register_dataset(cfg_resolved)
 
     # Optional hooks
     pip_size = float(instrument.get("pip_size", 0.0) or 0.0)
@@ -626,6 +774,9 @@ def run_from_config(
     delay_bars = int(delay_bars or 0)
 
     intents_by_bar, entry_delay_report = apply_entry_delay(intents_by_bar, delay_bars=delay_bars)
+
+    # NEW: Policy gate (after entry delay so index alignment is clean)
+    intents_by_bar, policy_gate_report = _apply_policy_gate_to_intents(intents_by_bar, cfg_resolved)
 
     # Costs resolve
     costs_cfg = dict(cfg_resolved.get("costs", {}))
@@ -684,15 +835,41 @@ def run_from_config(
 
     # Dataset identity fields
     metrics_raw["dataset_id"] = dataset_id_final
-    metrics_raw["dataset_fp8"] = dataset_meta.fingerprint_short
-    metrics_raw["dataset_rows"] = dataset_meta.rows
-    metrics_raw["dataset_start_time_utc"] = dataset_meta.start_ts
-    metrics_raw["dataset_end_time_utc"] = dataset_meta.end_ts
+    metrics_raw["dataset_fp8"] = getattr(dataset_meta, "fingerprint_short", None)
+    metrics_raw["dataset_rows"] = getattr(dataset_meta, "rows", None)
+    metrics_raw["dataset_start_time_utc"] = getattr(dataset_meta, "start_ts", None)
+    metrics_raw["dataset_end_time_utc"] = getattr(dataset_meta, "end_ts", None)
 
     metrics_raw["dataset_fingerprint_version"] = getattr(dataset_meta, "fingerprint_version", None)
     metrics_raw["dataset_file_sha256"] = getattr(dataset_meta, "file_sha256", None)
     metrics_raw["dataset_file_bytes"] = getattr(dataset_meta, "file_bytes", None)
     metrics_raw["dataset_source_path"] = getattr(dataset_meta, "source_path", None)
+
+    # Slice audit fields
+    metrics_raw["dataset_slice_start_utc"] = (dataset_slice_manifest.get("start_utc") if dataset_slice_manifest else None)
+    metrics_raw["dataset_slice_end_utc"] = (dataset_slice_manifest.get("end_utc") if dataset_slice_manifest else None)
+    metrics_raw["dataset_slice_fp8"] = dataset_slice_fp8
+
+    # Policy gate metrics (flat)
+    if policy_gate_report and policy_gate_report.get("enabled"):
+        stats = (policy_gate_report.get("stats") or {})
+        metrics_raw["policy_gate_enabled"] = True
+        metrics_raw["policy_gate_policy_id"] = stats.get("policy_id")
+        metrics_raw["policy_gate_policy_path"] = stats.get("policy_path")
+        metrics_raw["policy_gate_features_path"] = stats.get("features_path")
+        metrics_raw["policy_gate_time_bucket_min"] = policy_gate_report.get("time_bucket_min")
+        metrics_raw["policy_gate_attempted_entries"] = policy_gate_report.get("attempted_entries")
+        metrics_raw["policy_gate_blocked_total"] = policy_gate_report.get("blocked_total")
+        metrics_raw["policy_gate_blocked_unique_bars"] = policy_gate_report.get("blocked_unique_bars")
+        metrics_raw["policy_allowed"] = stats.get("policy_allowed")
+        metrics_raw["policy_blocked"] = stats.get("policy_blocked")
+        metrics_raw["policy_blocked_by_time"] = stats.get("policy_blocked_by_time")
+        metrics_raw["policy_blocked_by_shock_vol"] = stats.get("policy_blocked_by_shock_vol")
+        metrics_raw["policy_coverage_allowed"] = stats.get("policy_coverage_allowed")
+    elif policy_gate_report and policy_gate_report.get("enabled") is False:
+        metrics_raw["policy_gate_enabled"] = False
+    else:
+        metrics_raw["policy_gate_enabled"] = False
 
     # Risk (flat)
     metrics_raw["risk_max_daily_loss_R"] = risk_cfg_resolved.get("max_daily_loss_R")
@@ -729,7 +906,7 @@ def run_from_config(
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-    dataset_dict = dataset_meta.to_dict()
+    dataset_dict = dataset_meta.to_dict() if hasattr(dataset_meta, "to_dict") else {}
     dataset_dict["dataset_id"] = dataset_id_final
 
     execution_policy_block: Dict[str, Any] | None = None
@@ -752,9 +929,13 @@ def run_from_config(
         "cli_overrides": (cli_overrides or {}),
         "policy_sensitive_overrides": {
             "risk.eof_buffer_bars": policy_overrides.get("risk.eof_buffer_bars", None),
+            "risk.validity_mode": policy_overrides.get("risk.validity_mode", None),
         },
         "instrument": cfg_resolved.get("instrument", {}),
         "dataset_registry": cfg_resolved.get("dataset_registry", {}) or {},
+        "dataset_slice": dataset_slice_manifest,
+        "dataset_slice_fp8": dataset_slice_fp8,
+        "policy_gate": policy_gate_report,
         "shock_z": shock_manifest,
         "regime_fx": regime_fx_manifest,
         "dist_to_anchor": dist_anchor_manifest,
