@@ -14,6 +14,7 @@ execution:
   intrabar_path: OHLC
   intrabar_tie: sl_first
   entry_delay_bars: 0
+  policy_id: research_unbounded 
 risk:
   validity_mode: strict_no_eof
   force_exit_on_eof: true

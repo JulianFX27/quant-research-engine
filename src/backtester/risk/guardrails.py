@@ -1,4 +1,3 @@
-# src/backtester/risk/guardrails.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -20,6 +19,11 @@ class GuardrailsConfig:
     # Max holding bars (0 disables)
     max_holding_bars: int = 0
 
+    # NEW: no-hold-weekend guardrail (UTC)
+    weekend_exit_enabled: bool = False
+    weekend_exit_cutoff_utc: Optional[str] = None  # "HH:MM" on Friday
+    weekend_exit_weekday: int = 4  # Friday = 4 (Mon=0..Sun=6)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "max_concurrent_positions": self.max_concurrent_positions,
@@ -27,6 +31,9 @@ class GuardrailsConfig:
             "window_start_utc": self.window_start_utc,
             "window_end_utc": self.window_end_utc,
             "max_holding_bars": self.max_holding_bars,
+            "weekend_exit_enabled": self.weekend_exit_enabled,
+            "weekend_exit_cutoff_utc": self.weekend_exit_cutoff_utc,
+            "weekend_exit_weekday": self.weekend_exit_weekday,
         }
 
 
@@ -67,13 +74,30 @@ def _time_in_window_utc(ts_utc: pd.Timestamp, start_hm: Tuple[int, int], end_hm:
     return (cur >= start) or (cur < end)
 
 
+def _is_weekend_cutoff(ts_utc: pd.Timestamp, *, cutoff_hm: Tuple[int, int], weekday: int = 4) -> bool:
+    """
+    No-hold-weekend policy (deterministic, UTC):
+      - If ts_utc is on the specified weekday (default Friday=4)
+      - and time >= cutoff_hm
+      => force exit (close on that bar).
+    """
+    if ts_utc.tzinfo is None:
+        raise ValueError("Timestamp must be tz-aware UTC for weekend checks")
+    t = ts_utc.tz_convert("UTC")
+    if int(t.weekday()) != int(weekday):
+        return False
+    cur = int(t.hour) * 60 + int(t.minute)
+    cutoff = int(cutoff_hm[0]) * 60 + int(cutoff_hm[1])
+    return cur >= cutoff
+
+
 class Guardrails:
     """
     Stateless guardrail evaluator + stateful counters for a single run.
 
     Integrates with engine by checking:
       - allow_entry(bar_time_utc, active_positions)
-      - should_force_exit(holding_bars)
+      - should_force_exit(holding_bars, bar_time_utc=None)
     """
 
     def __init__(self, cfg: Dict[str, Any] | None):
@@ -84,10 +108,14 @@ class Guardrails:
             window_start_utc=cfg.get("window_start_utc"),
             window_end_utc=cfg.get("window_end_utc"),
             max_holding_bars=int(cfg.get("max_holding_bars", 0) or 0),
+            weekend_exit_enabled=bool(cfg.get("weekend_exit_enabled", False)),
+            weekend_exit_cutoff_utc=cfg.get("weekend_exit_cutoff_utc"),
+            weekend_exit_weekday=int(cfg.get("weekend_exit_weekday", 4) if cfg.get("weekend_exit_weekday") is not None else 4),
         )
         if self.cfg.max_concurrent_positions < 1:
             raise ValueError("max_concurrent_positions must be >= 1")
 
+        # Time window parsing
         if self.cfg.time_window_enabled:
             if not self.cfg.window_start_utc or not self.cfg.window_end_utc:
                 raise ValueError("time_window_enabled=true requires window_start_utc and window_end_utc")
@@ -97,6 +125,14 @@ class Guardrails:
             self._start_hm = None
             self._end_hm = None
 
+        # Weekend cutoff parsing
+        if self.cfg.weekend_exit_enabled:
+            if not self.cfg.weekend_exit_cutoff_utc:
+                raise ValueError("weekend_exit_enabled=true requires weekend_exit_cutoff_utc='HH:MM'")
+            self._weekend_cutoff_hm = _parse_hhmm(str(self.cfg.weekend_exit_cutoff_utc))
+        else:
+            self._weekend_cutoff_hm = None
+
         # Audit counters
         self.blocked = {
             "by_max_concurrent_positions": 0,
@@ -104,6 +140,7 @@ class Guardrails:
         }
         self.forced_exits = {
             "by_max_holding_bars": 0,
+            "by_weekend_no_hold": 0,
         }
 
     def allow_entry(self, bar_time_utc: pd.Timestamp, active_positions: int) -> Tuple[bool, Optional[str]]:
@@ -121,10 +158,19 @@ class Guardrails:
 
         return True, None
 
-    def should_force_exit(self, holding_bars: int) -> Tuple[bool, Optional[str]]:
+    def should_force_exit(self, holding_bars: int, bar_time_utc: Optional[pd.Timestamp] = None) -> Tuple[bool, Optional[str]]:
+        # 0) weekend no-hold (time-based, UTC)
+        if self.cfg.weekend_exit_enabled and (bar_time_utc is not None):
+            assert self._weekend_cutoff_hm is not None
+            if _is_weekend_cutoff(bar_time_utc, cutoff_hm=self._weekend_cutoff_hm, weekday=self.cfg.weekend_exit_weekday):
+                self.forced_exits["by_weekend_no_hold"] += 1
+                return True, "by_weekend_no_hold"
+
+        # 1) max holding bars
         if self.cfg.max_holding_bars and holding_bars >= self.cfg.max_holding_bars:
             self.forced_exits["by_max_holding_bars"] += 1
             return True, "by_max_holding_bars"
+
         return False, None
 
     def report(self) -> Dict[str, Any]:

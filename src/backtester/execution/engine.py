@@ -1,4 +1,3 @@
-# src/backtester/execution/engine.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -53,7 +52,6 @@ def _infer_bar_minutes_from_index(index: pd.Index, max_samples: int = 2000) -> O
     try:
         if index is None or len(index) < 2:
             return None
-        # Use only first N deltas for speed
         idx = pd.DatetimeIndex(index[: min(len(index), max_samples)])
         deltas = idx.to_series().diff().dropna()
         if deltas.empty:
@@ -82,18 +80,12 @@ class Trade:
     tag: str
     exit_reason: str
 
-    # Research-grade duration field (derived from bars; avoids gaps artifacts)
     hold_minutes: float | None = None
-
-    # Bar indices (critical for research: duration in TRUE bars, not time gaps)
     entry_idx: int | None = None
     exit_idx: int | None = None
 
-    # Persist SL/TP used for this trade (if available) so research metrics can compute R
     sl_price: float | None = None
     tp_price: float | None = None
-
-    # Formal R contract: risk measured in price units (can be proxy)
     risk_price: float | None = None
 
 
@@ -118,23 +110,6 @@ class SimpleBarEngine:
     eof_buffer_bars semantics:
       - 0 => DISABLED
       - >0 => block new entries if remaining_bars_to_eof <= eof_buffer_bars
-
-    Time-stop strategies (no SL/TP in price):
-      - Set risk.allow_missing_sl: true
-      - Provide risk.risk_proxy_price > 0 (in price units) to enable R metrics
-
-    NEW (regime-aware exits / gating):
-      - risk.regime_exit_enabled: bool
-      - risk.regime_exit_col: str (default "state_regime")
-      - risk.regime_exit_allowed: list[str] (e.g. ["RANGE"])
-      - risk.regime_gate_entries_enabled: bool
-      - risk.regime_gate_entries_col: str (default "state_regime")
-      - risk.regime_gate_entries_allowed: list[str]
-
-    NEW (strategy-driven exits):
-      - Strategy can emit OrderIntent(action="EXIT") while a position is open.
-        - fill_mode=close     => exit at current close
-        - fill_mode=next_open => exit at next bar open (no lookahead; same pattern as regime exit)
     """
 
     def __init__(self, *, costs: Dict[str, Any], exec_cfg: Dict[str, Any], risk_cfg: Optional[Dict[str, Any]] = None):
@@ -153,7 +128,6 @@ class SimpleBarEngine:
         risk_cfg_norm["force_exit_on_eof"] = self.force_exit_on_eof
 
         # max_holding_bars normalization (supports nested guardrails_cfg paths)
-        _mhb_int = 0
         try:
             _mhb_int = int(_extract_max_holding_bars(risk_cfg_norm) or 0)
         except Exception:
@@ -189,7 +163,7 @@ class SimpleBarEngine:
         self.min_risk_price: float = _mrp_f
         risk_cfg_norm["min_risk_price"] = float(self.min_risk_price)
 
-        # --- allow time-stop strategies with no SL ---
+        # allow time-stop strategies with no SL
         self.allow_missing_sl: bool = bool(risk_cfg_norm.get("allow_missing_sl", False))
         risk_cfg_norm["allow_missing_sl"] = bool(self.allow_missing_sl)
 
@@ -374,8 +348,6 @@ class SimpleBarEngine:
 
         pnl = self._apply_costs(raw_pnl, pos_qty)
 
-        # Research-grade duration:
-        # Prefer bar-based duration to avoid gaps artifacts.
         hold_m: float | None = None
         if (entry_idx is not None) and (exit_idx is not None) and (bar_minutes is not None) and (bar_minutes > 0):
             try:
@@ -383,7 +355,6 @@ class SimpleBarEngine:
             except Exception:
                 hold_m = None
         else:
-            # Fallback to timestamp delta
             try:
                 hold_m = float((pd.Timestamp(ts) - pd.Timestamp(entry_time)).total_seconds() / 60.0)
             except Exception:
@@ -410,7 +381,6 @@ class SimpleBarEngine:
     def run(self, df: pd.DataFrame, intents_by_bar: List[List[OrderIntent]]) -> List[Trade]:
         trades: List[Trade] = []
 
-        # Infer bar size once (robust to gaps)
         bar_minutes = _infer_bar_minutes_from_index(df.index)
 
         pos_side: Optional[str] = None
@@ -428,7 +398,6 @@ class SimpleBarEngine:
 
         pending_intent: Optional[OrderIntent] = None
         pending_tag: str = ""
-
         pending_exit_reason: Optional[str] = None
 
         current_day: Optional[str] = None
@@ -471,7 +440,6 @@ class SimpleBarEngine:
             last_bar_close = float(row["close"])
 
             day_key = self._utc_day_key(ts)
-
             if current_day is None:
                 current_day = day_key
             elif day_key != current_day:
@@ -696,6 +664,7 @@ class SimpleBarEngine:
                 exit_reason: Optional[str] = None
                 exit_level: Optional[float] = None
 
+                # SL/TP handling
                 if sl is not None or tp is not None:
                     if sl is not None and tp is not None:
                         reason = self._decide_exit_reason(o, h, l, c, pos_side, float(sl), float(tp))
@@ -710,6 +679,7 @@ class SimpleBarEngine:
                         if l <= float(tp) <= h:
                             exit_reason, exit_level = "TP", float(tp)
 
+                # Tie-break rule (defensive)
                 if exit_reason is None and sl is not None and tp is not None:
                     hit_sl = l <= float(sl) <= h
                     hit_tp = l <= float(tp) <= h
@@ -719,6 +689,7 @@ class SimpleBarEngine:
                         else:
                             exit_reason, exit_level = "SL", float(sl)
 
+                # Regime exits
                 if exit_reason is None and self.regime_exit_enabled and len(self.regime_exit_allowed) > 0:
                     if self.regime_exit_col in df.columns:
                         cur_reg = row.get(self.regime_exit_col, None)
@@ -735,16 +706,30 @@ class SimpleBarEngine:
                     else:
                         self._bump(forced_exits, "FORCE_REGIME_EXIT_MISSING_COL")
 
-                if exit_reason is None and pending_exit_reason is None and (self.max_holding_bars is not None):
+                # Guardrails force exits (time + max_holding_bars + weekend, etc.)
+                # FIX: removed "(... or True)" — condition is purely exit_reason/pending_exit_reason state.
+                if exit_reason is None and pending_exit_reason is None:
                     holding_bars = i - int(entry_index)
-                    force, force_reason = self.guardrails.should_force_exit(holding_bars=holding_bars)
+                    force, force_reason = self.guardrails.should_force_exit(
+                        holding_bars=holding_bars,
+                        bar_time_utc=pd.Timestamp(ts),
+                    )
                     if force:
-                        exit_reason = "FORCE_MAX_HOLD"
-                        exit_level = float(c)
-                        if force_reason:
-                            self._bump(forced_exits, str(force_reason))
-                        else:
+                        if force_reason == "by_weekend_no_hold":
+                            exit_reason = "FORCE_WEEKEND"
+                            exit_level = float(c)
+                            self._bump(forced_exits, "FORCE_WEEKEND")
+                        elif force_reason == "by_max_holding_bars":
+                            exit_reason = "FORCE_MAX_HOLD"
+                            exit_level = float(c)
                             self._bump(forced_exits, "MAX_HOLDING_BARS")
+                        else:
+                            exit_reason = "FORCE_MAX_HOLD"
+                            exit_level = float(c)
+                            if force_reason:
+                                self._bump(forced_exits, str(force_reason))
+                            else:
+                                self._bump(forced_exits, "MAX_HOLDING_BARS")
 
                 if exit_reason is not None and exit_level is not None:
                     trade = self._close_position(
@@ -805,6 +790,7 @@ class SimpleBarEngine:
                     blocked = False
                     blocked_reason: Optional[str] = None
 
+                    # v1 gates
                     if stopped_today:
                         n_blocked_by_daily_stop += 1
                         blocked = True
@@ -820,9 +806,9 @@ class SimpleBarEngine:
                         blocked = True
                         blocked_reason = "COOLDOWN"
 
+                    # v2 gates
                     if not blocked:
                         active_positions = 0
-
                         fill_index = i + 1 if self.fill_mode == "next_open" else i
                         remaining_bars = (n_bars - 1) - int(fill_index)
 
