@@ -26,13 +26,21 @@ risk:
   allow_missing_sl: false
   risk_proxy_price: 0.0005
 
-  # Permitimos forced exits explícitos
+  # Alineación con validator/engine (root-level)
+  max_holding_bars: 96
+
+  # OJO: debe matchear EXACTO el string del engine (según tus métricas: FORCE_WEEKEND)
   allowed_forced_exit_reasons:
     - FORCE_MAX_HOLD
     - FORCE_WEEKEND
 
   guardrails_cfg:
     max_holding_bars: 96
+
+    # No-hold-weekend (UTC): forzar salida desde este cutoff del viernes
+    weekend_exit_enabled: true
+    weekend_exit_cutoff_utc: "21:55"
+    weekend_exit_weekday: 4
 
 strategy:
   name: AnchorReversionFXNoBracket

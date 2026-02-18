@@ -24,7 +24,6 @@ from backtester.orchestrator.regime_fx_hook import attach_regime_fx_if_enabled
 from backtester.orchestrator.shock_z_hook import attach_shock_z_if_enabled
 from backtester.strategies.registry import make_strategy
 
-# NEW: policy gate (your implementation)
 from backtester.policies.policy_gate import PolicyGate, PolicyGateConfig
 
 
@@ -33,19 +32,6 @@ from backtester.policies.policy_gate import PolicyGate, PolicyGateConfig
 # ----------------------------
 
 def _parse_scalar(s: str) -> Any:
-    """
-    Parse a scalar string to bool/int/float/None/str, with JSON list/dict support.
-
-    Rules:
-      - JSON: if raw is a JSON list/dict literal (starts with '[' or '{'), try json.loads(raw)
-      - true/false/yes/no/y/n (case-insensitive) -> bool
-      - null/none/~ -> None
-      - int-like -> int
-      - float-like -> float
-      - else -> string (stripped)
-
-    NOTE: We intentionally do NOT treat "1"/"0" as bool to avoid ambiguity.
-    """
     if s is None:
         return None
     if not isinstance(s, str):
@@ -55,7 +41,6 @@ def _parse_scalar(s: str) -> Any:
     if raw == "":
         return ""
 
-    # JSON container support: sessions=[], params={"a":1}, etc.
     if raw.startswith("[") or raw.startswith("{"):
         try:
             return json.loads(raw)
@@ -70,14 +55,12 @@ def _parse_scalar(s: str) -> Any:
     if low in ("null", "none", "~"):
         return None
 
-    # int
     try:
         if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
             return int(raw)
     except Exception:
         pass
 
-    # float
     try:
         v = float(raw)
         if math.isfinite(v):
@@ -139,12 +122,6 @@ def _apply_cli_overrides(cfg: Dict[str, Any], set_items: list[str] | None) -> Di
 # ----------------------------
 
 def _deep_merge(base: Any, overlay: Any) -> Any:
-    """
-    Deep merge dictionaries without dropping unknown keys.
-    overlay wins on conflicts.
-    - If both are dict -> merge recursively
-    - Else -> overlay (if overlay is not None) else base
-    """
     if isinstance(base, dict) and isinstance(overlay, dict):
         out = dict(base)
         for k, v in overlay.items():
@@ -161,10 +138,6 @@ def _deep_merge(base: Any, overlay: Any) -> Any:
 # ----------------------------
 
 def _json_safe(obj: Any) -> Any:
-    """
-    Make an object JSON-serializable deterministically.
-    - Handles dataclasses (OrderIntent), pandas/numpy scalars, Path, sets, etc.
-    """
     if is_dataclass(obj):
         try:
             return _json_safe(asdict(obj))
@@ -307,8 +280,10 @@ def _get_validity_mode(cfg: Dict[str, Any]) -> str | None:
 
 def _extract_max_holding_bars_from_cfg(cfg: Dict[str, Any]) -> int | None:
     """
-    IMPORTANT: for your anchor strategy, the real time-stop is:
-      strategy.params.max_hold_bars
+    Canon order:
+      1) strategy.params.max_hold_bars (if present)
+      2) risk.guardrails_cfg.max_holding_bars (your canonical guardrails block)
+      3) risk.max_holding_bars (legacy/overlay)
     """
     strat = cfg.get("strategy", {}) or {}
     if isinstance(strat, dict):
@@ -319,31 +294,50 @@ def _extract_max_holding_bars_from_cfg(cfg: Dict[str, Any]) -> int | None:
                 return v0
 
     risk = cfg.get("risk", {}) or {}
-
-    g = risk.get("guardrails")
-    if isinstance(g, dict):
-        v = _norm_int(g.get("max_holding_bars"))
-        if v is not None:
-            return v
-        gcfg = g.get("guardrails_cfg")
+    if isinstance(risk, dict):
+        gcfg = risk.get("guardrails_cfg")
         if isinstance(gcfg, dict):
-            v2 = _norm_int(gcfg.get("max_holding_bars"))
-            if v2 is not None:
-                return v2
+            v1 = _norm_int(gcfg.get("max_holding_bars"))
+            if v1 is not None:
+                return v1
 
-    g2 = cfg.get("guardrails")
-    if isinstance(g2, dict):
-        v3 = _norm_int(g2.get("max_holding_bars"))
-        if v3 is not None:
-            return v3
-
-    gcfg2 = cfg.get("guardrails_cfg")
-    if isinstance(gcfg2, dict):
-        v4 = _norm_int(gcfg2.get("max_holding_bars"))
-        if v4 is not None:
-            return v4
+        v2 = _norm_int(risk.get("max_holding_bars"))
+        if v2 is not None:
+            return v2
 
     return None
+
+
+def _resolve_risk_cfg_for_engine(cfg_resolved: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Make risk_cfg deterministic for the engine:
+      - Keep original risk dict for audit.
+      - If risk.guardrails_cfg exists, flatten its keys to risk top-level for Guardrails().
+      - Do NOT drop unknown keys.
+    """
+    risk = cfg_resolved.get("risk", {}) or {}
+    if not isinstance(risk, dict):
+        return {}
+
+    out = dict(risk)
+
+    gcfg = risk.get("guardrails_cfg")
+    if isinstance(gcfg, dict) and gcfg:
+        # Flatten known guardrails keys
+        for k in (
+            "max_concurrent_positions",
+            "time_window_enabled",
+            "window_start_utc",
+            "window_end_utc",
+            "max_holding_bars",
+            "weekend_exit_enabled",
+            "weekend_exit_cutoff_utc",
+            "weekend_exit_weekday",
+        ):
+            if k in gcfg and gcfg.get(k) is not None:
+                out[k] = gcfg.get(k)
+
+    return out
 
 
 def _enforce_strict_no_eof_entry_safety(cfg_resolved: Dict[str, Any]) -> None:
@@ -363,7 +357,6 @@ def _enforce_strict_no_eof_entry_safety(cfg_resolved: Dict[str, Any]) -> None:
 
     eofb_eff = int(eofb or 0)
 
-    # safety margin in bars to prevent accidental EOF interactions
     margin = 12
     required = int(max_hold) + margin
     if eofb_eff < required:
@@ -435,10 +428,6 @@ def _apply_dataset_slice(df: pd.DataFrame, cfg: Dict[str, Any]) -> tuple[pd.Data
 
 
 def _slice_fingerprint_short(df: pd.DataFrame) -> str:
-    """
-    Fingerprint derivado del slice (no del archivo).
-    Determinista: hash del contenido serializado en CSV (incluye índice como columna).
-    """
     tmp = df.copy()
     tmp.insert(0, "__time__", tmp.index.astype("datetime64[ns, UTC]").astype(str))
     b = tmp.to_csv(index=False).encode("utf-8")
@@ -474,11 +463,9 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
         keep_extra_cols=True,
     )
 
-    # Apply dataset slice (optional)
     df, slice_manifest = _apply_dataset_slice(df, cfg)
     slice_fp8 = _slice_fingerprint_short(df) if slice_manifest else None
 
-    # recomputar start/end basados en df realmente usado
     start_ymd = _ts_to_ymd(df.index.min())
     end_ymd = _ts_to_ymd(df.index.max())
 
@@ -495,7 +482,6 @@ def _load_bars_and_register_dataset(cfg: Dict[str, Any]) -> tuple[pd.DataFrame, 
 
     dataset_meta_final = replace(dataset_meta, dataset_id=dataset_id_final)
 
-    # actualizar metadata a lo usado realmente (sin tocar file_sha, etc.)
     try:
         dataset_meta_final = replace(
             dataset_meta_final,
@@ -544,6 +530,26 @@ def _is_regime_fx_enabled(cfg_resolved: Dict[str, Any]) -> bool:
     return False
 
 
+def _is_weekend_exit_enabled(cfg_resolved: Dict[str, Any]) -> bool:
+    risk = cfg_resolved.get("risk", {}) or {}
+    if not isinstance(risk, dict):
+        return False
+    gcfg = risk.get("guardrails_cfg")
+    if isinstance(gcfg, dict):
+        v = gcfg.get("weekend_exit_enabled")
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.strip().lower() not in ("false", "0", "no", "n")
+    # fallback legacy
+    v2 = risk.get("weekend_exit_enabled")
+    if isinstance(v2, bool):
+        return v2
+    if isinstance(v2, str):
+        return v2.strip().lower() not in ("false", "0", "no", "n")
+    return False
+
+
 def _allowed_forced_exit_reasons(cfg_resolved: Dict[str, Any]) -> set[str]:
     risk = cfg_resolved.get("risk", {}) or {}
     reasons_raw = risk.get("allowed_forced_exit_reasons", None)
@@ -561,6 +567,9 @@ def _allowed_forced_exit_reasons(cfg_resolved: Dict[str, Any]) -> set[str]:
     max_hold_cfg = _extract_max_holding_bars_from_cfg(cfg_resolved)
     if max_hold_cfg is not None and int(max_hold_cfg) > 0:
         out.add("FORCE_MAX_HOLD")
+
+    if _is_weekend_exit_enabled(cfg_resolved):
+        out.add("FORCE_WEEKEND")
 
     if _is_regime_fx_enabled(cfg_resolved):
         out.add("FORCE_REGIME_EXIT")
@@ -640,19 +649,13 @@ def _summarize_intents(intents_by_bar: list[Any], *, sample_max: int = 5) -> Dic
 
 
 # ----------------------------
-# Policy gate wiring (your PolicyGate API)
+# Policy gate wiring (PolicyGate API)
 # ----------------------------
 
 def _apply_policy_gate_to_intents(
     intents_by_bar: list[Any],
     cfg_resolved: Dict[str, Any],
 ) -> tuple[list[Any], Dict[str, Any] | None]:
-    """
-    Apply PolicyGate by BAR INDEX using PolicyGate.evaluate_entry_idx(i).
-
-    We gate bars where intent is non-empty (i.e., strategy attempted something).
-    This is intentionally conservative and matches how your diagnostics are currently tracked.
-    """
     pg = cfg_resolved.get("policy_gate", None)
     if not isinstance(pg, dict) or not pg:
         return intents_by_bar, None
@@ -690,7 +693,6 @@ def _apply_policy_gate_to_intents(
         attempted += 1
         ok = gate.evaluate_entry_idx(int(i))
         if not ok:
-            # drop the intent for this bar
             out[i] = None
             blocked += 1
             blocked_unique_bars += 1
@@ -716,14 +718,11 @@ def run_from_config(
     *,
     cli_overrides: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    # Keep original user cfg values for policy-sensitive keys
     policy_overrides = _capture_policy_sensitive_overrides(cfg)
 
-    # Apply execution policy overlay, but DO NOT DROP UNKNOWN KEYS
     pol_res = apply_execution_policy(cfg)
     cfg_resolved = pol_res.cfg_resolved if pol_res is not None else cfg
 
-    # CRITICAL FIX: preserve unknown keys (risk.validity_mode, risk.eof_buffer_bars, dataset_slice, policy_gate, etc.)
     cfg_resolved = _deep_merge(cfg, cfg_resolved)
 
     _apply_policy_sensitive_overrides(cfg_resolved, policy_overrides)
@@ -741,10 +740,8 @@ def run_from_config(
     started_at_utc = datetime.now(timezone.utc).isoformat()
     instrument = cfg_resolved.get("instrument", {}) or {}
 
-    # Load + dataset registry (+ optional slice)
     df, dataset_meta, dataset_id_final, dataset_slice_manifest, dataset_slice_fp8 = _load_bars_and_register_dataset(cfg_resolved)
 
-    # Optional hooks
     pip_size = float(instrument.get("pip_size", 0.0) or 0.0)
     df, dist_anchor_manifest = attach_dist_to_anchor_if_enabled(df, cfg_resolved, pip_size=pip_size)
     df, shock_manifest = attach_shock_z_if_enabled(df, cfg_resolved, dataset_id=dataset_id_final)
@@ -766,7 +763,6 @@ def run_from_config(
 
     intent_diag = _summarize_intents(intents_by_bar, sample_max=5)
 
-    # Entry delay
     exe_cfg = cfg_resolved.get("execution", {}) or {}
     delay_bars = _norm_int(exe_cfg.get("entry_delay_bars"))
     if delay_bars is None:
@@ -775,10 +771,8 @@ def run_from_config(
 
     intents_by_bar, entry_delay_report = apply_entry_delay(intents_by_bar, delay_bars=delay_bars)
 
-    # NEW: Policy gate (after entry delay so index alignment is clean)
     intents_by_bar, policy_gate_report = _apply_policy_gate_to_intents(intents_by_bar, cfg_resolved)
 
-    # Costs resolve
     costs_cfg = dict(cfg_resolved.get("costs", {}))
     pip_size = float(instrument.get("pip_size", 0.0) or 0.0)
 
@@ -799,7 +793,9 @@ def run_from_config(
         if "slippage_pips" in costs and "slippage_price" not in costs:
             costs["slippage_price"] = float(costs.get("slippage_pips", 0.0)) * pip_size
 
-    risk_cfg = cfg_resolved.get("risk", {}) or {}
+    # IMPORTANT: resolve risk cfg for engine deterministically (flatten guardrails_cfg)
+    risk_cfg_raw = cfg_resolved.get("risk", {}) or {}
+    risk_cfg = _resolve_risk_cfg_for_engine(cfg_resolved)
 
     engine = SimpleBarEngine(costs=costs, exec_cfg=exe_cfg, risk_cfg=risk_cfg)
     trades = engine.run(df, intents_by_bar)
@@ -812,14 +808,12 @@ def run_from_config(
     pf = metrics_raw.get("profit_factor")
     metrics_raw["profit_factor_is_inf"] = isinstance(pf, float) and (not math.isfinite(pf))
 
-    # Intent diagnostics in metrics
     metrics_raw.update({
         "intents_total_bars": intent_diag["intents_total_bars"],
         "intents_non_null_bars": intent_diag["intents_non_null_bars"],
         "intents_non_empty_bars": intent_diag["intents_non_empty_bars"],
     })
 
-    # Execution diagnostics
     metrics_raw["execution_policy_id"] = (exe_cfg.get("policy_id") if isinstance(exe_cfg, dict) else None)
     metrics_raw["execution_fill_mode"] = (exe_cfg.get("fill_mode") if isinstance(exe_cfg, dict) else None)
     metrics_raw["execution_intrabar_path"] = (
@@ -833,7 +827,6 @@ def run_from_config(
 
     _flatten_entry_delay_into_metrics(metrics_raw, entry_delay_report)
 
-    # Dataset identity fields
     metrics_raw["dataset_id"] = dataset_id_final
     metrics_raw["dataset_fp8"] = getattr(dataset_meta, "fingerprint_short", None)
     metrics_raw["dataset_rows"] = getattr(dataset_meta, "rows", None)
@@ -845,12 +838,10 @@ def run_from_config(
     metrics_raw["dataset_file_bytes"] = getattr(dataset_meta, "file_bytes", None)
     metrics_raw["dataset_source_path"] = getattr(dataset_meta, "source_path", None)
 
-    # Slice audit fields
     metrics_raw["dataset_slice_start_utc"] = (dataset_slice_manifest.get("start_utc") if dataset_slice_manifest else None)
     metrics_raw["dataset_slice_end_utc"] = (dataset_slice_manifest.get("end_utc") if dataset_slice_manifest else None)
     metrics_raw["dataset_slice_fp8"] = dataset_slice_fp8
 
-    # Policy gate metrics (flat)
     if policy_gate_report and policy_gate_report.get("enabled"):
         stats = (policy_gate_report.get("stats") or {})
         metrics_raw["policy_gate_enabled"] = True
@@ -871,7 +862,6 @@ def run_from_config(
     else:
         metrics_raw["policy_gate_enabled"] = False
 
-    # Risk (flat)
     metrics_raw["risk_max_daily_loss_R"] = risk_cfg_resolved.get("max_daily_loss_R")
     metrics_raw["risk_max_trades_per_day"] = risk_cfg_resolved.get("max_trades_per_day")
     metrics_raw["risk_cooldown_bars"] = risk_cfg_resolved.get("cooldown_bars")
@@ -886,23 +876,19 @@ def run_from_config(
     metrics_raw["risk_final_realized_R_today"] = risk_report.get("final_realized_R_today")
     metrics_raw["risk_final_stopped_today"] = risk_report.get("final_stopped_today")
 
-    # status
     status_block = _compute_run_status(metrics_raw, cfg_resolved)
     metrics_raw.update(status_block)
 
     metrics = _sanitize_for_json(metrics_raw)
 
-    # Persist trades
     trades_path = run_dir / "trades.csv"
     trades_dicts = trades_to_dicts(trades)
     pd.DataFrame(trades_dicts).to_csv(trades_path, index=False)
 
-    # Persist equity
     equity_path = run_dir / "equity.csv"
     equity_df = _build_equity_curve(df, trades_dicts)
     equity_df.to_csv(equity_path, index=False)
 
-    # Persist metrics
     metrics_path = run_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
@@ -951,6 +937,7 @@ def run_from_config(
             "spread_pips_effective": spread_pips_eff,
             "slippage_pips_effective": slippage_pips_eff,
         },
+        "risk_raw": risk_cfg_raw,
         "risk": risk_cfg_resolved,
         "risk_report": risk_report,
         "entry_delay_report": {

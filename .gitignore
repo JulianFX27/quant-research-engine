@@ -15,3 +15,5 @@ data/**/data/*.csv
 data/**/data/*.parquet
 results/
 src/backtester.egg-info/
+# External datasets
+data/

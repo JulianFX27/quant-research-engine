@@ -109,6 +109,46 @@ def _parse_iso_utc(s: str, *, field: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _validate_guardrails_cfg(guardrails_cfg: Dict[str, Any]) -> None:
+    if not isinstance(guardrails_cfg, dict):
+        raise ValueError("Invalid risk.guardrails_cfg: must be a mapping/dict")
+
+    mh = _as_int(guardrails_cfg, "max_holding_bars", default=None)
+    if mh is not None and mh < 0:
+        raise ValueError("Invalid risk.guardrails_cfg.max_holding_bars: must be >= 0")
+
+    wee = _as_bool(guardrails_cfg, "weekend_exit_enabled", default=False)
+    if wee:
+        cutoff = guardrails_cfg.get("weekend_exit_cutoff_utc")
+        if not isinstance(cutoff, str) or not cutoff.strip():
+            raise ValueError(
+                "Invalid risk.guardrails_cfg.weekend_exit_cutoff_utc: required when weekend_exit_enabled=true"
+            )
+        _validate_hhmm_utc(str(cutoff), field="risk.guardrails_cfg.weekend_exit_cutoff_utc")
+
+        weekday = _as_int(guardrails_cfg, "weekend_exit_weekday", default=4)
+        if weekday is None or weekday < 0 or weekday > 6:
+            raise ValueError("Invalid risk.guardrails_cfg.weekend_exit_weekday: must be in [0..6]")
+
+    tw = _as_bool(guardrails_cfg, "time_window_enabled", default=False)
+    if tw:
+        ws = guardrails_cfg.get("window_start_utc")
+        we = guardrails_cfg.get("window_end_utc")
+        if not ws or not we:
+            raise ValueError("risk.guardrails_cfg.time_window_enabled=true requires window_start_utc and window_end_utc")
+        _validate_hhmm_utc(str(ws), field="risk.guardrails_cfg.window_start_utc")
+        _validate_hhmm_utc(str(we), field="risk.guardrails_cfg.window_end_utc")
+
+    mcp = _as_int(guardrails_cfg, "max_concurrent_positions", default=1)
+    if mcp is None or int(mcp) < 1:
+        raise ValueError("Invalid risk.guardrails_cfg.max_concurrent_positions: must be >= 1")
+    if int(mcp) != 1:
+        raise ValueError(
+            "Invalid risk.guardrails_cfg.max_concurrent_positions: engine supports only 1 concurrent position.\n"
+            "Fix: set to 1."
+        )
+
+
 def validate_run_config(cfg: dict) -> None:
     if not isinstance(cfg, dict):
         raise ValueError(f"Run config must be a dict, got {type(cfg).__name__}")
@@ -198,7 +238,7 @@ def validate_run_config(cfg: dict) -> None:
     if params is not None and not isinstance(params, dict):
         raise ValueError("Invalid strategy.params: must be a mapping/dict if provided")
 
-    max_hold_bars = None
+    strategy_max_hold_bars = None
     if isinstance(params, dict):
         qty = _as_float(params, "qty", default=None)
         if qty is not None and qty <= 0:
@@ -227,9 +267,11 @@ def validate_run_config(cfg: dict) -> None:
         if tp_pips is not None and tp_pips <= 0:
             raise ValueError(f"Invalid strategy.params.tp_pips: must be > 0, got {params.get('tp_pips')!r}")
 
-        max_hold_bars = _as_int(params, "max_hold_bars", default=None)
-        if max_hold_bars is not None and max_hold_bars < 0:
-            raise ValueError(f"Invalid strategy.params.max_hold_bars: must be >= 0, got {params.get('max_hold_bars')!r}")
+        strategy_max_hold_bars = _as_int(params, "max_hold_bars", default=None)
+        if strategy_max_hold_bars is not None and strategy_max_hold_bars < 0:
+            raise ValueError(
+                f"Invalid strategy.params.max_hold_bars: must be >= 0, got {params.get('max_hold_bars')!r}"
+            )
 
     # ---- Execution ----
     exe = cfg["execution"]
@@ -284,7 +326,7 @@ def validate_run_config(cfg: dict) -> None:
         if cd is not None and cd < 0:
             raise ValueError(f"Invalid risk.cooldown_bars: must be >= 0, got {risk.get('cooldown_bars')!r}")
 
-        # v2 guardrails (single-position engine policy)
+        # v2 guardrails (engine policy)
         mcp = _as_int(risk, "max_concurrent_positions", default=1)
         if mcp is None or int(mcp) < 1:
             raise ValueError(
@@ -309,6 +351,23 @@ def validate_run_config(cfg: dict) -> None:
         if mhb is not None and mhb < 0:
             raise ValueError(f"Invalid risk.max_holding_bars: must be >= 0, got {risk.get('max_holding_bars')!r}")
 
+        # --- Canon guardrails_cfg (recommended) ---
+        gcfg = risk.get("guardrails_cfg", None)
+        if gcfg is not None:
+            if not isinstance(gcfg, dict):
+                raise ValueError("Invalid risk.guardrails_cfg: must be a mapping/dict")
+            _validate_guardrails_cfg(gcfg)
+
+            # Consistency: if both strategy.max_hold_bars and guardrails_cfg.max_holding_bars exist, they must match
+            g_mh = _as_int(gcfg, "max_holding_bars", default=None)
+            if strategy_max_hold_bars is not None and g_mh is not None:
+                if int(strategy_max_hold_bars) != int(g_mh):
+                    raise ValueError(
+                        "MAX_HOLD_BARS_MISMATCH:\n"
+                        f"  strategy.params.max_hold_bars={strategy_max_hold_bars} but risk.guardrails_cfg.max_holding_bars={g_mh}\n"
+                        "Fix: set them equal (single source of truth)."
+                    )
+
         # --- EOF validity policy ---
         validity_mode = risk.get("validity_mode", None)
         if validity_mode is not None:
@@ -331,15 +390,27 @@ def validate_run_config(cfg: dict) -> None:
         if force_exit_on_eof is None:
             raise ValueError("Invalid risk.force_exit_on_eof: must be bool-like or null")
 
-        # Cross-check: si hay max_hold_bars, el buffer debe cubrirlo en strict_no_eof
-        if max_hold_bars is not None and max_hold_bars > 0:
+        # Cross-check: if strict_no_eof and we have a max-hold, buffer should cover it
+        # Use canonical: prefer strategy.max_hold_bars else guardrails_cfg.max_holding_bars else risk.max_holding_bars
+        effective_mh = None
+        if strategy_max_hold_bars is not None and int(strategy_max_hold_bars) > 0:
+            effective_mh = int(strategy_max_hold_bars)
+        else:
+            if isinstance(gcfg, dict):
+                g_mh = _as_int(gcfg, "max_holding_bars", default=None)
+                if g_mh is not None and int(g_mh) > 0:
+                    effective_mh = int(g_mh)
+            if effective_mh is None and mhb is not None and int(mhb) > 0:
+                effective_mh = int(mhb)
+
+        if effective_mh is not None and (risk.get("validity_mode") == "strict_no_eof"):
             margin = 12  # 12 barras = 60 min en M5
-            required_buf = int(max_hold_bars) + margin
-            if eof_buffer_bars < required_buf and (risk.get("validity_mode") == "strict_no_eof"):
+            required_buf = int(effective_mh) + margin
+            if eof_buffer_bars < required_buf:
                 raise ValueError(
                     "RISK_EOF_BUFFER_TOO_SMALL:\n"
-                    f"  risk.validity_mode=strict_no_eof requires risk.eof_buffer_bars >= max_hold_bars + margin\n"
-                    f"  got eof_buffer_bars={eof_buffer_bars}, max_hold_bars={max_hold_bars}, required>={required_buf}\n"
+                    f"  risk.validity_mode=strict_no_eof requires risk.eof_buffer_bars >= max_hold + margin\n"
+                    f"  got eof_buffer_bars={eof_buffer_bars}, effective_max_hold={effective_mh}, required>={required_buf}\n"
                     "Fix:\n"
                     f"  - set risk.eof_buffer_bars: {required_buf} (or higher), OR\n"
                     "  - disable strict mode (validity_mode: warn_only/off) if you want to allow EOF-impacted samples."
