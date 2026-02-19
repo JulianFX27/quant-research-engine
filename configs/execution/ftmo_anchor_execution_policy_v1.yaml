@@ -1,0 +1,101 @@
+execution_policy:
+  name: FTMO_Anchor_ExecutionPolicy_v1
+  instrument: EURUSD
+  strategy: AnchorMR
+  mode: paper_or_live
+  timezone_day_rollover: "Europe/Prague"   # FTMO uses CET/CEST (Prague aligns)
+  day_rollover_time: "00:00:00"
+
+account_limits:
+  ftmo:
+    max_loss_total_pct: 0.10       # ML: -10% from initial balance (equity-based)
+    max_daily_loss_pct: 0.05       # MDL: -5% from start-of-day equity
+
+internal_limits:
+  hard_stop_total_dd_pct: 0.08     # STOP if drawdown from peak >= 8%
+  daily_stop_pct: 0.015            # STOP day if loss from day start >= 1.5%
+
+risk_mode:
+  challenge:
+    base_risk_pct_per_trade: 0.50
+  funded:
+    base_risk_pct_per_trade: 0.40
+
+throttle:
+  enabled: true
+  type: drawdown_based
+  schedule:
+    - dd_min_pct: 0.0
+      dd_max_pct: 3.0
+      risk_multiplier: 1.00
+    - dd_min_pct: 3.0
+      dd_max_pct: 5.0
+      risk_multiplier: 0.80
+    - dd_min_pct: 5.0
+      dd_max_pct: 6.5
+      risk_multiplier: 0.60
+    - dd_min_pct: 6.5
+      dd_max_pct: 8.0
+      risk_multiplier: 0.50
+    - dd_min_pct: 8.0
+      dd_max_pct: 100.0
+      risk_multiplier: 0.00
+
+trade_controls:
+  max_trades_per_day: 1
+  allow_reentry_same_day: false
+  allow_multiple_positions: false
+  max_concurrent_positions: 1
+
+order_execution:
+  fill_mode: next_open          # safer / more realistic than same-close
+  slippage_model:
+    enabled: true
+    kind: fixed_pips
+    value_pips: 0.0             # set from broker logs later (paper first)
+  spread_model:
+    enabled: true
+    kind: fixed_pips
+    value_pips: 0.0             # set from broker logs later
+  intrabar:
+    enabled: true
+    path_mode: OHLC             # keep consistent with your engine
+    tie_break: tp_first         # or sl_first; must be consistent with research
+
+safety:
+  on_daily_stop:
+    action: disable_trading_until_next_day
+  on_hard_stop_dd:
+    action: disable_trading_and_require_manual_reset
+  on_ftmo_limit_hit:
+    action: disable_trading_and_alert
+
+logging_audit:
+  required_fields:
+    - run_id
+    - policy_name
+    - account_mode
+    - equity_start_day
+    - equity_peak
+    - equity_current
+    - dd_current
+    - daily_pnl_pct
+    - risk_base_pct
+    - risk_multiplier
+    - risk_effective_pct
+    - order_intent_id
+    - filled_entry_price
+    - sl_price
+    - tp_price
+    - exit_reason
+    - R
+  export:
+    trades_csv: true
+    equity_csv: true
+    daily_summary_csv: true
+    json_manifest: true
+
+notes:
+  linkage:
+    policy_config: configs/prop/ftmo_anchor_policy_v1.yaml
+    monte_carlo_reference: results/prop/ftmo_anchor_mc_v2/summary_grid.csv

@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0.0",
+  "policy_name": "FTMO_Anchor_ExecutionPolicy_v1",
+  "account_mode": "challenge",
+  "timezone_day_rollover": "Europe/Prague",
+  "day_rollover_time": "00:00:00",
+
+  "initial_balance": 1.0,
+  "equity_current": 1.0,
+  "equity_peak": 1.0,
+
+  "current_day_id": null,
+  "equity_start_day": null,
+  "daily_pnl_pct": 0.0,
+
+  "dd_current_pct": 0.0,
+  "hard_stop_dd_triggered": false,
+  "daily_stop_triggered": false,
+  "trading_enabled": true,
+
+  "trades_taken_today": 0,
+  "max_trades_per_day": 1,
+
+  "last_update_utc": null,
+  "last_run_id": null,
+
+  "audit_tail": []
+}

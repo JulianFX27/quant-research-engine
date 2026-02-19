@@ -1,0 +1,71 @@
+policy:
+  name: FTMO_Anchor_Policy_v1
+  instrument: EURUSD
+  strategy: AnchorMR
+  account_type: FTMO_2_Step
+  assumption:
+    trades_per_day: 1
+    day_rollover: "CEST_00:00"
+
+ftmo_rules:
+  max_loss_total:
+    type: absolute
+    threshold: 0.10        # 10% of initial balance
+  max_daily_loss:
+    type: relative
+    threshold: 0.05        # 5% from day start equity
+  phase_targets:
+    phase_1: 0.10          # +10%
+    phase_2: 0.05          # +5%
+
+internal_governance:
+  hard_stop_dd:
+    threshold: 0.08        # Stop trading if DD >= 8%
+  daily_stop_internal:
+    threshold: -0.015      # Stop trading rest of day if <= -1.5%
+
+risk:
+  challenge:
+    r_base: 0.0050         # 0.50% per trade
+  funded:
+    r_base: 0.0040         # 0.40% per trade
+
+throttle:
+  type: dd_based
+  schedule:
+    - dd_min: 0.00
+      dd_max: 0.03
+      multiplier: 1.00
+    - dd_min: 0.03
+      dd_max: 0.05
+      multiplier: 0.80
+    - dd_min: 0.05
+      dd_max: 0.065
+      multiplier: 0.60
+    - dd_min: 0.065
+      dd_max: 0.08
+      multiplier: 0.50
+    - dd_min: 0.08
+      dd_max: 1.00
+      multiplier: 0.00
+
+execution:
+  trades_per_day: 1
+  allow_multiple_positions: false
+  reentry_same_day: false
+
+promotion:
+  funded_upgrade:
+    condition:
+      min_trades: 25
+      equity_high: true
+      observed_dd_p95: 0.07
+    new_r_base: 0.0045     # Optional upgrade to 0.45%
+
+notes:
+  monte_carlo_reference:
+    bootstrap: block_k5
+    stress_profile: tail
+    p_breach: 0.00
+    p95_max_dd: 0.0591
+    p_stop_internal: 0.0023
