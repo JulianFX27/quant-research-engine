@@ -4,7 +4,7 @@
 # Version: freeze_v1
 # Gating: V6
 # Date: 2026-02-18
-# Commit: d38813a38d4e9f76d318205d9f253c7ffc7f89eb
+# Commit: dca7849b2e07b479df4c301dfc2f5b4d4f453912
 # ===============================================
 name: anchor_mr_pure_thr_8p__realistic_v1__gated_policy_v3__8h__sl_tp__no_weekend
 symbol: EURUSD
