@@ -1,0 +1,77 @@
+policy_id: anchor_mr_pure_8p_policy_v3_train_le_2022
+strategy: Strategy Anchor MR Pure 8p
+instrument: EURUSD
+timeframe: M5
+binning:
+  shock_col: shock_z
+  shock_ret_col: shock_log_ret
+  shock_bins: 4
+  vol_col: atr_14
+  vol_bins: 3
+  session_bucket_min: 30
+thresholds:
+  min_n: 50
+  enable_expectancy_R: 0.2
+  disable_expectancy_R: -0.1
+rules:
+  enable_shock_vol:
+  - shock_sign: +
+    shock_mag_bin: Q1
+    vol_bucket: VOL_LOW
+  - shock_sign: +
+    shock_mag_bin: Q1
+    vol_bucket: VOL_HIGH
+  - shock_sign: +
+    shock_mag_bin: Q2
+    vol_bucket: VOL_LOW
+  - shock_sign: +
+    shock_mag_bin: Q3
+    vol_bucket: VOL_LOW
+  - shock_sign: '-'
+    shock_mag_bin: Q1
+    vol_bucket: VOL_LOW
+  - shock_sign: '-'
+    shock_mag_bin: Q2
+    vol_bucket: VOL_LOW
+  - shock_sign: '-'
+    shock_mag_bin: Q3
+    vol_bucket: VOL_HIGH
+  disable_shock_vol:
+  - shock_sign: +
+    shock_mag_bin: Q3
+    vol_bucket: VOL_MED
+  - shock_sign: +
+    shock_mag_bin: Q3
+    vol_bucket: VOL_HIGH
+  - shock_sign: +
+    shock_mag_bin: Q4
+    vol_bucket: VOL_HIGH
+  - shock_sign: '-'
+    shock_mag_bin: Q3
+    vol_bucket: VOL_LOW
+  - shock_sign: '-'
+    shock_mag_bin: Q4
+    vol_bucket: VOL_HIGH
+  - shock_sign: +
+    shock_mag_bin: Q1
+    vol_bucket: VOL_MED
+  - shock_sign: +
+    shock_mag_bin: Q2
+    vol_bucket: VOL_MED
+  - shock_sign: '-'
+    shock_mag_bin: Q1
+    vol_bucket: VOL_MED
+  - shock_sign: '-'
+    shock_mag_bin: Q2
+    vol_bucket: VOL_MED
+  - shock_sign: '-'
+    shock_mag_bin: Q4
+    vol_bucket: VOL_MED
+  disable_session_buckets:
+  - 25
+  - 26
+  - 27
+meta:
+  trained_on: years<=2022
+  source_run_id: 20260215_133651_250993_127e247b
+  derived_from: policy_gate_v2_train_le_2022.yaml

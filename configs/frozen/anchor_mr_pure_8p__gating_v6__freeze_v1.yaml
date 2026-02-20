@@ -64,6 +64,6 @@ strategy:
     tp_pips: 15
 
 policy_gate:
-  policy_path: results/research/strategy_anchor_mr_pure_8p/diagnostics/policy_gate_v3_train_le_2022.yaml
+  policy_path: configs/frozen/gates/policy_gate_v3_train_le_2022__freeze_v1.yaml
   features_path: data/anchor_reversion_fx/data/eurusd_m5_features.csv
   time_bucket_min: 30
