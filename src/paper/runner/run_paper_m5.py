@@ -543,6 +543,7 @@ def main() -> None:
         allow_same_bar_exit=True,
     )
 
+    # Strategy (adapter)
     strat = AnchorReversionAdapter(
         AnchorAdapterConfig(
             anchor_col=args.anchor_col,
@@ -619,6 +620,8 @@ def main() -> None:
     def close_and_persist(trade, bar_ts_utc: datetime, reason_hint: str) -> None:
         nonlocal state
 
+        # NOTE: hook should happen AFTER persistence, but keeping your existing order is ok
+        # as long as the adapter's internal state resets on close.
         if hasattr(strat, "on_trade_closed_reset"):
             strat.on_trade_closed_reset()
 
@@ -721,12 +724,18 @@ def main() -> None:
                     continue
 
                 if engine.has_pending_intent() and (not engine.has_open_position()):
+                    # cancel pending intent if possible
                     if hasattr(engine, "cancel_pending_intent"):
                         engine.cancel_pending_intent(reason="WEEKEND_CUTOFF_CANCEL")
                         manifest["events"]["intent_cancels"] += 1
                         append_log(paths["logs"], f"[{utc_now_iso()}] WEEKEND_CUTOFF pending_intent=True -> CANCEL")
                     else:
                         append_log(paths["logs"], f"[{utc_now_iso()}] WEEKEND_CUTOFF pending_intent=True (no cancel API)")
+
+                    # >>> IMPORTANT: adapter hook
+                    if hasattr(strat, "on_intent_cancelled"):
+                        strat.on_intent_cancelled()
+
                     continue
 
                 continue
@@ -742,12 +751,20 @@ def main() -> None:
                 pip_size=float(args.pip_size),
             )
 
-            # Pending intent path
+            # ------------------------------------------------------------
+            # Pending intent path (fill at next_open)
+            # ------------------------------------------------------------
             if engine.has_pending_intent() and (not engine.has_open_position()):
                 closed = engine.on_bar(bar)
 
+                # Case A: pending -> fill+close same bar (engine returns a Trade)
                 if closed is not None:
                     manifest["events"]["fills"] += 1
+
+                    # >>> IMPORTANT: adapter hook (fill confirmed)
+                    if hasattr(strat, "on_trade_opened_confirmed"):
+                        strat.on_trade_opened_confirmed()
+
                     state = rsm.load_state()
                     state = rsm.on_trade_opened(state, run_id=run_id, now_utc=bar.ts_utc)
                     rsm.save_state(state)
@@ -755,14 +772,23 @@ def main() -> None:
                     close_and_persist(closed, bar.ts_utc, reason_hint="(filled+closed)")
                     continue
 
+                # Case B: pending -> filled, now open
                 if engine.has_open_position():
                     manifest["events"]["fills"] += 1
+
+                    # >>> IMPORTANT: adapter hook (fill confirmed)
+                    if hasattr(strat, "on_trade_opened_confirmed"):
+                        strat.on_trade_opened_confirmed()
+
                     state = rsm.load_state()
                     state = rsm.on_trade_opened(state, run_id=run_id, now_utc=bar.ts_utc)
                     rsm.save_state(state)
 
                 continue
 
+            # ------------------------------------------------------------
+            # Open position path
+            # ------------------------------------------------------------
             if engine.has_open_position():
                 intent = strat.on_bar(bar, ctx)
                 if intent is not None:
@@ -783,6 +809,9 @@ def main() -> None:
                     close_and_persist(closed, bar.ts_utc, reason_hint="(tp/sl)")
                 continue
 
+            # ------------------------------------------------------------
+            # No open position: entry gating by risk state manager
+            # ------------------------------------------------------------
             if not rsm.can_trade(state, run_id=run_id, now_utc=bar.ts_utc):
                 continue
 
@@ -846,6 +875,10 @@ def main() -> None:
                 f"dir={intent.direction} sl={intent.sl_price} tp={intent.tp_price}"
             )
 
+            # >>> IMPORTANT: adapter hook (intent actually submitted)
+            if hasattr(strat, "on_intent_submitted"):
+                strat.on_intent_submitted(intent.direction)
+
             engine.submit_intent(intent, risk_base_pct=r_base, risk_multiplier=mult, risk_effective_pct=r_eff)
             manifest["events"]["entries_submitted"] += 1
 
@@ -897,7 +930,7 @@ def main() -> None:
             "hard_stop_dd_triggered": bool(st.get("hard_stop_dd_triggered", False)) if isinstance(st, dict) else False,
         }
 
-        # NOTE (Option A):
+        # NOTE:
         # - Keep gate + events ONLY at manifest root for auditability.
         # - Do NOT duplicate inside summary to avoid divergence / double "gate" keys in JSON.
 

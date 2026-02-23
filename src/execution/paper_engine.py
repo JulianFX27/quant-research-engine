@@ -59,6 +59,12 @@ class PaperEngine:
         tie-break: tp_first or sl_first when both hit within same bar.
     - Risk is expressed as percentage of equity (r_eff).
       PnL in equity space: pnl = r_eff * R_multiple
+
+    IMPORTANT:
+    - If strategy submits SL/TP computed on the signal bar close, but execution is
+      next_open, gaps can invert SL relative to filled entry. To avoid this, we support
+      computing SL/TP at FILL time using meta keys:
+        _sl_pips, _tp_pips, _pip_size, _recalc_sl_tp_at_fill
     """
 
     def __init__(
@@ -146,7 +152,6 @@ class PaperEngine:
 
         # 2) Evaluate exit for open position
         if self._open_trade is not None:
-            # Optionally disallow exiting on the same bar as entry
             if not self.allow_same_bar_exit and self._open_trade.entry_time_utc == bar.ts_utc:
                 return None
 
@@ -154,7 +159,7 @@ class PaperEngine:
             if hit is not None:
                 price, reason = hit
                 closed_trade = self._close_trade(self._open_trade, bar.ts_utc, price, reason)
-                self._open_trade = None  # clear after close
+                self._open_trade = None
 
         return closed_trade
 
@@ -182,8 +187,56 @@ class PaperEngine:
         entry_price = float(bar.open)  # next_open fill
         entry_time = bar.ts_utc
 
+        meta = dict(intent.meta or {})
+
+        # Default: use provided absolute SL/TP
+        sl_price = float(intent.sl_price) if intent.sl_price is not None else None
+        tp_price = float(intent.tp_price) if intent.tp_price is not None else None
+
+        # Optional: recompute SL/TP at fill based on pips (freeze-compatible)
+        recalc = bool(meta.get("_recalc_sl_tp_at_fill", False))
+        sl_pips = meta.get("_sl_pips", None)
+        tp_pips = meta.get("_tp_pips", None)
+        pip_size = meta.get("_pip_size", None)
+
+        if recalc and (sl_pips is not None) and (tp_pips is not None) and (pip_size is not None):
+            pip = float(pip_size)
+            if pip <= 0:
+                raise PaperExecutionError("Invalid _pip_size in intent.meta (must be > 0).")
+
+            sl_dist = float(sl_pips) * pip
+            tp_dist = float(tp_pips) * pip
+
+            if intent.direction == "LONG":
+                sl_price = entry_price - sl_dist
+                tp_price = entry_price + tp_dist
+            else:
+                sl_price = entry_price + sl_dist
+                tp_price = entry_price - tp_dist
+
+            meta["_sl_price_filled"] = float(sl_price)
+            meta["_tp_price_filled"] = float(tp_price)
+            meta["_entry_price_filled"] = float(entry_price)
+
+        # Hard validation: SL must be on correct side of entry
+        if sl_price is None or tp_price is None:
+            raise PaperExecutionError("Intent missing SL/TP (sl_price/tp_price must be set).")
+
+        if intent.direction == "LONG":
+            if not (sl_price < entry_price and tp_price > entry_price):
+                raise PaperExecutionError(
+                    f"Invalid LONG SL/TP relative to filled entry. "
+                    f"entry={entry_price:.6f} sl={sl_price:.6f} tp={tp_price:.6f}"
+                )
+        else:
+            if not (sl_price > entry_price and tp_price < entry_price):
+                raise PaperExecutionError(
+                    f"Invalid SHORT SL/TP relative to filled entry. "
+                    f"entry={entry_price:.6f} sl={sl_price:.6f} tp={tp_price:.6f}"
+                )
+
         # Risk price contract
-        risk_price = abs(entry_price - float(intent.sl_price))
+        risk_price = abs(entry_price - float(sl_price))
         if risk_price <= 0:
             raise PaperExecutionError("Invalid risk_price (entry == SL).")
 
@@ -193,13 +246,13 @@ class PaperEngine:
             direction=intent.direction,
             entry_time_utc=entry_time,
             entry_price=entry_price,
-            sl_price=float(intent.sl_price),
-            tp_price=float(intent.tp_price),
+            sl_price=float(sl_price),
+            tp_price=float(tp_price),
             risk_base_pct=float(risk["risk_base_pct"]),
             risk_multiplier=float(risk["risk_multiplier"]),
             risk_effective_pct=float(risk["risk_effective_pct"]),
             risk_price=float(risk_price),
-            meta=dict(intent.meta),
+            meta=meta,
         )
 
         # clear pending
@@ -209,37 +262,23 @@ class PaperEngine:
         return tr
 
     def _check_exit_intrabar(self, tr: Trade, bar: Bar) -> Optional[tuple[float, str]]:
-        """
-        Return (exit_price, reason) if TP or SL is hit within this bar.
-        """
         o, h, l, c = float(bar.open), float(bar.high), float(bar.low), float(bar.close)
         tp, sl = float(tr.tp_price), float(tr.sl_price)
 
-        # Determine which levels are "inside" the bar range
         tp_hit = (l <= tp <= h)
         sl_hit = (l <= sl <= h)
 
         if not tp_hit and not sl_hit:
             return None
 
-        # If only one is hit -> easy
         if tp_hit and not sl_hit:
             return tp, "TP"
         if sl_hit and not tp_hit:
             return sl, "SL"
 
-        # Both hit within the same bar -> need intrabar model
         return self._resolve_both_hit(tr, bar)
 
     def _resolve_both_hit(self, tr: Trade, bar: Bar) -> tuple[float, str]:
-        """
-        Both TP and SL are within the bar range.
-        Use intrabar_path model:
-          OHLC: price visits Open -> High -> Low -> Close
-          OLHC: price visits Open -> Low -> High -> Close
-        For LONG/SHORT, determine which is reached first.
-        If ambiguous (e.g., both in same leg), use tie_break.
-        """
         o, h, l, c = float(bar.open), float(bar.high), float(bar.low), float(bar.close)
         tp, sl = float(tr.tp_price), float(tr.sl_price)
 
@@ -250,7 +289,6 @@ class PaperEngine:
         else:
             raise PaperExecutionError(f"Unknown intrabar_path: {self.intrabar_path}")
 
-        # Evaluate each segment in order
         for a, b in zip(path[:-1], path[1:]):
             seg_low = min(a, b)
             seg_high = max(a, b)
@@ -266,12 +304,10 @@ class PaperEngine:
             if sl_in and not tp_in:
                 return sl, "SL"
 
-            # both within same segment => ambiguous, apply tie-break
             if self.tie_break == "tp_first":
                 return tp, "TP"
             return sl, "SL"
 
-        # Fallback: if somehow not resolved, apply tie-break
         if self.tie_break == "tp_first":
             return tp, "TP"
         return sl, "SL"
@@ -281,9 +317,6 @@ class PaperEngine:
         tr.exit_price = float(exit_price)
         tr.exit_reason = reason
 
-        # Compute R multiple based on direction
-        # LONG: profit = exit - entry
-        # SHORT: profit = entry - exit
         if tr.direction == "LONG":
             raw = tr.exit_price - tr.entry_price
             risk_unit = tr.entry_price - tr.sl_price
@@ -292,12 +325,9 @@ class PaperEngine:
             risk_unit = tr.sl_price - tr.entry_price
 
         if risk_unit <= 0:
-            # should not happen if SL is on correct side, but guard
             raise PaperExecutionError("Invalid SL placement relative to entry (risk_unit <= 0).")
 
         R_multiple = raw / risk_unit
-
-        # Equity PnL in pct terms = risk_effective_pct * R_multiple
         pnl = tr.risk_effective_pct * R_multiple
 
         tr.R = float(R_multiple)
