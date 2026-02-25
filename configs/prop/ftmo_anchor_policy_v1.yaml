@@ -21,9 +21,9 @@ order_execution:
 
 risk_mode:
   challenge:
-    base_risk_pct_per_trade: 1.00    # 0.50% (runner divides by 100)
+    base_risk_pct_per_trade: 0.75    # <-- CAMBIO (antes 1.00)
   funded:
-    base_risk_pct_per_trade: 0.40    # 0.40%
+    base_risk_pct_per_trade: 0.75    # <-- CAMBIO (antes 0.40)
 
 throttle:
   type: dd_based
@@ -50,9 +50,8 @@ trade_controls:
   reentry_same_day: false
 
 paper:
-  pnl_mode: absolute
+  pnl_mode: return   # <-- MUY IMPORTANTE (compounding FTMO)
 
-# ---- Reference-only metadata (runner ignores) ----
 policy_reference:
   assumption:
     trades_per_day: 1
@@ -75,7 +74,7 @@ promotion:
       min_trades: 25
       equity_high: true
       observed_dd_p95: 0.07
-    new_r_base: 0.0045
+    new_r_base: 0.0075
 
 notes:
   monte_carlo_reference:

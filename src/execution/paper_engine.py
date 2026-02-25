@@ -38,8 +38,8 @@ class Trade:
     risk_effective_pct: float = 0.0
 
     risk_price: float = 0.0  # abs(entry - sl)
-    pnl: float = 0.0         # equity-space pnl in % terms: e.g., +0.0023 = +0.23%
-    R: float = 0.0           # pnl / (risk_effective_pct)
+    pnl: float = 0.0         # equity-space pnl in "absolute-return units": e.g., +0.0023 = +0.23%
+    R: float = 0.0           # pnl / risk_effective_pct
 
     meta: Dict[str, Any] = field(default_factory=dict)
 
@@ -95,6 +95,38 @@ class PaperEngine:
 
     def get_open_trade(self) -> Optional[Trade]:
         return self._open_trade
+
+    # ----------------------------
+    # Mark-to-market helpers
+    # ----------------------------
+    @staticmethod
+    def compute_unrealized_R(tr: Trade, price: float) -> float:
+        """
+        Compute floating R-multiple at a given price (no costs).
+        R_multiple = raw / risk_unit
+        """
+        px = float(price)
+
+        if tr.direction == "LONG":
+            raw = px - tr.entry_price
+            risk_unit = tr.entry_price - tr.sl_price
+        else:
+            raw = tr.entry_price - px
+            risk_unit = tr.sl_price - tr.entry_price
+
+        if risk_unit <= 0:
+            raise PaperExecutionError("Invalid SL placement relative to entry (risk_unit <= 0).")
+
+        return float(raw / risk_unit)
+
+    @staticmethod
+    def compute_unrealized_pnl(tr: Trade, price: float) -> float:
+        """
+        Floating PnL in equity-space units, consistent with Trade.pnl:
+          pnl_unreal = risk_effective_pct * R_multiple(price)
+        """
+        r_mult = PaperEngine.compute_unrealized_R(tr, price=float(price))
+        return float(tr.risk_effective_pct * r_mult)
 
     # ----------------------------
     # Intent submission

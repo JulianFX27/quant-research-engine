@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 from datetime import datetime, timezone, time, timedelta
+import os
+from pathlib import Path
 
 try:
     from zoneinfo import ZoneInfo
@@ -81,11 +83,25 @@ class RiskStateManager:
     # IO
     # ----------------------------
     def load_state(self) -> Dict[str, Any]:
+        """
+        Load risk state from JSON.
+
+        Paper-live requirement:
+        - If the state file does not exist yet, initialize it with a valid schema v2 state.
+        """
+        p = Path(self.state_path)
+        if not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            st = self._init_state(now_utc=self._now_utc())
+            atomic_json_write(self.state_path, st)
+            return st
+
         state = json_read(self.state_path)
         state = self._upgrade_and_validate(state)
         return state
 
     def save_state(self, state: Dict[str, Any]) -> None:
+        Path(self.state_path).parent.mkdir(parents=True, exist_ok=True)
         atomic_json_write(self.state_path, state)
 
     def load_override(self) -> Dict[str, Any]:
@@ -94,6 +110,73 @@ class RiskStateManager:
         except FileNotFoundError:
             return dict(DEFAULT_OVERRIDE)
         return override
+
+    # ----------------------------
+    # State init
+    # ----------------------------
+    def _init_state(self, now_utc: datetime) -> Dict[str, Any]:
+        """
+        Create a brand-new state with all required keys (schema v2).
+
+        Initial balance source:
+        - env PAPER_INITIAL_BALANCE if set (float)
+        - else default 100000.0
+        """
+        # default initial balance
+        init_bal = 100000.0
+        env_bal = os.getenv("PAPER_INITIAL_BALANCE", "").strip()
+        if env_bal:
+            try:
+                init_bal = float(env_bal)
+            except Exception:
+                init_bal = 100000.0
+
+        day_id = self.current_day_id(now_utc)
+
+        st: Dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
+
+            # identity/meta
+            "policy_name": "UNSET",
+            "account_mode": "UNSET",
+            "timezone_day_rollover": self.cfg.tz_name,
+            "day_rollover_time": self.cfg.rollover_time,
+
+            # equity anchors
+            "initial_balance": float(init_bal),
+            "equity_current": float(init_bal),
+            "equity_peak": float(init_bal),
+
+            # day anchors
+            "current_day_id": day_id,
+            "equity_start_day": float(init_bal),
+
+            # daily stats (signed + loss-style)
+            "daily_pnl_pct": 0.0,
+            "daily_loss_pct": 0.0,
+
+            # dd analytics
+            "dd_from_peak_pct": 0.0,
+            "dd_current_pct": 0.0,  # legacy alias
+
+            # overall loss
+            "overall_loss_pct": 0.0,
+
+            # gates
+            "hard_stop_dd_triggered": False,
+            "daily_stop_triggered": False,
+            "trading_enabled": True,
+
+            # trade limits
+            "trades_taken_today": 0,
+            "max_trades_per_day": 1,
+
+            # bookkeeping
+            "last_update_utc": now_utc.isoformat().replace("+00:00", "Z"),
+            "last_run_id": None,
+            "audit_tail": [],
+        }
+        return st
 
     # ----------------------------
     # Time helpers
@@ -123,21 +206,11 @@ class RiskStateManager:
     def current_day_id(self, now_utc: Optional[datetime] = None) -> str:
         """
         FTMO-style day_id with configurable local rollover boundary.
-
-        Definition:
-          - Convert now_utc -> local_dt (Europe/Prague)
-          - The "trading day" starts at local rollover_time (cfg.rollover_time).
-          - If local time is BEFORE rollover_time, it belongs to previous calendar date.
-          - Else, it belongs to current calendar date.
-
-        Example (rollover_time=00:00:00): day_id is simply local calendar date.
-        Example (rollover_time=23:00:00): times 00:00..22:59 belong to previous day_id.
         """
         now_utc = now_utc or self._now_utc()
         local_dt = self._local_dt(now_utc)
 
-        # Compare local time to boundary; if before boundary -> previous day.
-        local_t = local_dt.timetz().replace(tzinfo=None)  # pure time comparison
+        local_t = local_dt.timetz().replace(tzinfo=None)
         boundary = self._rollover_local_time
 
         if local_t < boundary:
@@ -160,14 +233,12 @@ class RiskStateManager:
         state["current_day_id"] = self.current_day_id(now_utc)
         state["equity_start_day"] = float(state["equity_current"])
 
-        # Reset daily metrics
         state["daily_pnl_pct"] = 0.0
         state["daily_loss_pct"] = 0.0
 
         state["daily_stop_triggered"] = False
         state["trades_taken_today"] = 0
 
-        # Enabled depends on hard stop
         state["trading_enabled"] = not bool(state.get("hard_stop_dd_triggered", False))
 
         state["last_update_utc"] = now_utc.isoformat().replace("+00:00", "Z")
@@ -180,16 +251,11 @@ class RiskStateManager:
     # Trade lifecycle hooks
     # ----------------------------
     def on_trade_opened(self, state: Dict[str, Any], run_id: str, now_utc: Optional[datetime] = None) -> Dict[str, Any]:
-        """
-        Count trades at OPEN (or intent fill), not at close.
-        This aligns max_trades_per_day with actual positions taken.
-        """
         now_utc = now_utc or self._now_utc()
         state = self.rollover_if_needed(state, run_id=run_id, now_utc=now_utc)
 
         state["trades_taken_today"] = int(state.get("trades_taken_today", 0) + 1)
 
-        # If reached max trades, disable further trading for the day.
         if int(state["trades_taken_today"]) >= int(state.get("max_trades_per_day", 1)):
             state["trading_enabled"] = False
 
@@ -200,26 +266,19 @@ class RiskStateManager:
         return state
 
     def on_trade_closed(self, state: Dict[str, Any], equity_after: float, run_id: str, now_utc: Optional[datetime] = None) -> Dict[str, Any]:
-        """
-        Update equity + FTMO-style daily/overall loss.
-        Also keeps dd_from_peak_pct as analytics (NOT used for FTMO hard stop).
-        """
         now_utc = now_utc or self._now_utc()
 
-        # Ensure day initialized (uses rollover boundary)
         state = self.rollover_if_needed(state, run_id=run_id, now_utc=now_utc)
 
         state["equity_current"] = float(equity_after)
         state["equity_peak"] = float(max(float(state["equity_peak"]), float(state["equity_current"])))
 
-        # --- Analytics: DD from peak (not FTMO)
         peak = float(state["equity_peak"])
         dd_peak = (peak - float(state["equity_current"])) / peak if peak > 0 else 0.0
         dd_from_peak_pct = float(dd_peak * 100.0)
         state["dd_from_peak_pct"] = dd_from_peak_pct
-        state["dd_current_pct"] = dd_from_peak_pct  # backward-compat field used in logs/plots
+        state["dd_current_pct"] = dd_from_peak_pct
 
-        # --- Daily PnL (signed)
         day_start = state.get("equity_start_day")
         if day_start is None or float(day_start) <= 0:
             state["equity_start_day"] = float(state["equity_current"])
@@ -229,17 +288,13 @@ class RiskStateManager:
         daily_ret = (float(state["equity_current"]) - day_start_f) / day_start_f if day_start_f > 0 else 0.0
         state["daily_pnl_pct"] = float(daily_ret * 100.0)
 
-        # --- FTMO-style DAILY LOSS (positive number)
-        # daily_loss_pct = max(0, (equity_start_day - equity_current)/equity_start_day * 100)
         daily_loss = (day_start_f - float(state["equity_current"])) / day_start_f if day_start_f > 0 else 0.0
         state["daily_loss_pct"] = float(max(0.0, daily_loss) * 100.0)
 
-        # --- FTMO-style OVERALL LOSS from initial balance (positive number)
         init_bal = float(state.get("initial_balance") or 0.0)
         overall_loss = (init_bal - float(state["equity_current"])) / init_bal if init_bal > 0 else 0.0
         state["overall_loss_pct"] = float(max(0.0, overall_loss) * 100.0)
 
-        # Apply account-level gates (FTMO-style loss limits)
         if float(state["daily_loss_pct"]) >= float(self.cfg.max_daily_loss_pct):
             state["daily_stop_triggered"] = True
             state["trading_enabled"] = False
@@ -283,7 +338,6 @@ class RiskStateManager:
 
         state["hard_stop_dd_triggered"] = False
 
-        # Re-enable only if other gates aren't active
         if (not bool(state.get("daily_stop_triggered", False))) and int(state.get("trades_taken_today", 0)) < int(state.get("max_trades_per_day", 1)):
             state["trading_enabled"] = True
 
@@ -297,25 +351,21 @@ class RiskStateManager:
     # Schema upgrade + Audit
     # ----------------------------
     def _upgrade_and_validate(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        # Validate at least v1 shape
         missing_v1 = [k for k in REQUIRED_KEYS_V1 if k not in state]
         if missing_v1:
             raise ValueError(f"Risk state missing keys (v1): {missing_v1}")
 
-        # Upgrade schema_version
         try:
             sv = int(state.get("schema_version", 1))
         except Exception:
             sv = 1
 
         if sv < SCHEMA_VERSION:
-            # Add v2 keys with safe defaults
             state.setdefault("daily_loss_pct", 0.0)
             state.setdefault("overall_loss_pct", 0.0)
             state.setdefault("dd_from_peak_pct", float(state.get("dd_current_pct", 0.0)))
             state["schema_version"] = SCHEMA_VERSION
 
-        # Validate v2 extras exist (after upgrade)
         missing_v2 = [k for k in REQUIRED_KEYS_V2_EXTRA if k not in state]
         if missing_v2:
             raise ValueError(f"Risk state missing keys (v2): {missing_v2}")
