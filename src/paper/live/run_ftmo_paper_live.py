@@ -1,15 +1,28 @@
 from __future__ import annotations
 
+# ------------------------------------------------------------
+# BOOTSTRAP: ensure repo root is on sys.path so `import src...` works
+# Works when running: python .\src\paper\live\run_ftmo_paper_live.py
+# ------------------------------------------------------------
+import sys
+from pathlib import Path
+
+_THIS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _THIS_FILE.parents[3]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+# ------------------------------------------------------------
+# Standard imports
+# ------------------------------------------------------------
 import argparse
 import csv
 from dataclasses import replace
 from datetime import datetime, timezone, time as dtime
-from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List
 
 from zoneinfo import ZoneInfo
 
-from src.data.providers import CSVBarProvider, CSVProviderConfig, DataValidationError
 from src.execution.paper_engine import PaperEngine
 from src.paper.risk.risk_state_manager import RiskStateManager, RiskConfig
 from src.runner.interfaces import StrategyContext, OrderIntent
@@ -26,7 +39,7 @@ from src.runner.artifacts import (
 
 from src.strategies.anchor_adapter import AnchorReversionAdapter, AnchorAdapterConfig
 
-# LIVE provider (paper_live mode)
+# LIVE tail provider (persistent)
 from src.live.csv_tail_provider import TailCSVBarProvider, TailCSVConfig
 
 
@@ -69,19 +82,11 @@ def _shape_hint(obj: Any) -> str:
 
 
 def _resolve_execution_policy(exec_cfg: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
-    """
-    Returns (ep_full, meta, dbg)
-
-    Your runtime shape:
-      root has: internal_limits, order_execution, risk_mode, throttle, trade_controls, ...
-      and root["execution_policy"] has: name, instrument, timezone_day_rollover, etc.
-    """
     dbg: Dict[str, Any] = {"exec_cfg_shape": _shape_hint(exec_cfg)}
 
     if not isinstance(exec_cfg, dict):
         raise TypeError(f"Execution policy config must be a dict, got {type(exec_cfg)}")
 
-    # Case: flattened/root policy
     if ("internal_limits" in exec_cfg) and ("order_execution" in exec_cfg) and ("risk_mode" in exec_cfg):
         meta = exec_cfg.get("execution_policy", {})
         if not isinstance(meta, dict):
@@ -90,7 +95,6 @@ def _resolve_execution_policy(exec_cfg: Dict[str, Any]) -> tuple[Dict[str, Any],
         dbg["meta_shape"] = _shape_hint(meta)
         return exec_cfg, meta, dbg
 
-    # Case: canonical YAML shape
     if "execution_policy" in exec_cfg and isinstance(exec_cfg["execution_policy"], dict):
         ep = exec_cfg["execution_policy"]
         dbg["selected"] = "CANONICAL"
@@ -102,12 +106,6 @@ def _resolve_execution_policy(exec_cfg: Dict[str, Any]) -> tuple[Dict[str, Any],
 
 
 def _bar_feature(bar: Any, key: str) -> Any:
-    """
-    Robust feature getter:
-    - direct attribute (bar.shock_z)
-    - dict containers (bar.extras['shock_z'], bar.meta['shock_z'], etc.)
-    - __dict__ fallback
-    """
     if hasattr(bar, key):
         return getattr(bar, key)
 
@@ -124,37 +122,13 @@ def _bar_feature(bar: Any, key: str) -> Any:
 
 
 def _is_weekend_cutoff(ts_utc: datetime) -> bool:
-    """
-    True if ts_utc is on/after Friday 16:55 NY time.
-    DST-safe: convert from UTC to America/New_York.
-    """
     ny = ts_utc.astimezone(NY_TZ)
-    if ny.weekday() != 4:  # Monday=0 ... Friday=4
+    if ny.weekday() != 4:
         return False
     return ny.time() >= WEEKEND_CUTOFF_NY
 
 
 class PolicyGate:
-    """
-    Minimal policy gate evaluator (freeze YAML v3).
-
-    IMPORTANT:
-      - If required features are missing because CSV extras drop NaNs per-row,
-        then early bars (warmup) will not carry shock_z/shock_log_ret/atr_14 keys
-        even though columns exist.
-      - That must be treated as SKIP (no decision), not BLOCK.
-
-    Behavior:
-      - If session bucket disabled => BLOCK (reason=DISABLED_SESSION_BUCKET)
-      - If required features missing/NaN => SKIP (reason=MISSING_REQUIRED_FEATURES_WARMUP)
-      - If (shock_sign, shock_mag_bin, vol_bucket) matches enable list => ALLOW
-      - If matches disable list => BLOCK
-      - Else => BLOCK (reason=NO_MATCH)
-
-    Notes:
-      - session_bucket computed in NY timezone (DST-safe)
-    """
-
     def __init__(self, gate_cfg: Dict[str, Any]):
         self.cfg = gate_cfg
         self.policy_id = str(gate_cfg.get("policy_id", "UNKNOWN_GATE"))
@@ -172,12 +146,19 @@ class PolicyGate:
 
     @staticmethod
     def _is_missing(x: Any) -> bool:
+        # Treat None / "" / "nan" / NaN as missing.
         if x is None:
             return True
+        if isinstance(x, str):
+            s = x.strip().lower()
+            if s == "" or s == "nan" or s == "none":
+                return True
         try:
-            return float(x) != float(x)  # NaN
+            v = float(x)
+            return v != v  # NaN
         except Exception:
-            return False
+            # If it can't be converted to float, consider it missing for gating
+            return True
 
     @staticmethod
     def _session_bucket_30m_ny(ts_utc: datetime) -> int:
@@ -197,7 +178,6 @@ class PolicyGate:
 
     @staticmethod
     def _vol_bucket_from_atr(atr_14: float) -> str:
-        # Deterministic pragmatic buckets in price terms for EURUSD M5.
         a = float(atr_14)
         if a <= 0.00022:
             return "VOL_LOW"
@@ -206,15 +186,8 @@ class PolicyGate:
         return "VOL_HIGH"
 
     def evaluate_bar(self, ts_utc: datetime, feats: Dict[str, Any]) -> Tuple[Optional[bool], Dict[str, Any]]:
-        """
-        Returns:
-          - (True,  meta)  => ALLOW
-          - (False, meta)  => BLOCK
-          - (None, meta)   => SKIP (warmup/missing features)
-        """
         session_bucket = self._session_bucket_30m_ny(ts_utc)
 
-        # Session disable
         if session_bucket in self.disable_session_buckets:
             return False, {"gate": "BLOCK", "reason": "DISABLED_SESSION_BUCKET", "session_bucket": session_bucket}
 
@@ -222,7 +195,6 @@ class PolicyGate:
         shock_ret = feats.get(self.shock_ret_col)
         atr_14 = feats.get(self.vol_col)
 
-        # Missing required features => SKIP (warmup/NaNs)
         if self._is_missing(shock_z) or self._is_missing(shock_ret) or self._is_missing(atr_14):
             return None, {
                 "gate": "SKIP",
@@ -241,7 +213,6 @@ class PolicyGate:
 
         key = {"shock_sign": shock_sign, "shock_mag_bin": shock_mag_bin, "vol_bucket": vol_bucket}
 
-        # Explicit disable beats enable
         for row in self.disable:
             if (
                 str(row.get("shock_sign")) == shock_sign
@@ -261,9 +232,6 @@ class PolicyGate:
         return False, {"gate": "BLOCK", "reason": "NO_MATCH", "session_bucket": session_bucket, **key}
 
 
-# -----------------------------
-# End-of-run metrics (no leakage)
-# -----------------------------
 def _to_float(x: Any, default: float = 0.0) -> float:
     try:
         if x is None:
@@ -285,7 +253,6 @@ def _parse_iso_dt(s: Any) -> Optional[datetime]:
     if not txt:
         return None
     try:
-        # trades.csv uses Z (UTC). datetime.fromisoformat doesn't parse 'Z' in all versions.
         if txt.endswith("Z"):
             txt = txt[:-1] + "+00:00"
         return datetime.fromisoformat(txt)
@@ -321,14 +288,13 @@ def summarize_trades_csv(trades_path: str) -> Dict[str, Any]:
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
 
     avg_R = float(sum(Rs)) / float(n)
-    expectancy_R = avg_R  # in R-space, expectancy is the mean R
+    expectancy_R = avg_R
 
     win_Rs = [r for r in Rs if r > 0]
     loss_Rs = [r for r in Rs if r < 0]
     avg_win_R = float(sum(win_Rs)) / float(len(win_Rs)) if win_Rs else 0.0
     avg_loss_R = float(sum(loss_Rs)) / float(len(loss_Rs)) if loss_Rs else 0.0
 
-    # hold time stats (minutes)
     holds: List[float] = []
     for r in rows:
         et = _parse_iso_dt(r.get("entry_time_utc"))
@@ -354,7 +320,6 @@ def summarize_trades_csv(trades_path: str) -> Dict[str, Any]:
     med_hold = _pct(holds_sorted, 0.50)
     p95_hold = _pct(holds_sorted, 0.95)
 
-    # categorical counts
     by_exit: Dict[str, int] = {}
     by_dir: Dict[str, int] = {}
     by_day: Dict[str, int] = {}
@@ -404,13 +369,9 @@ def summarize_trades_csv(trades_path: str) -> Dict[str, Any]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="FTMO-aware Paper Live Runner (CSV tail, persistent state)")
 
-    ap.add_argument("--csv", required=True)
-    ap.add_argument("--time_col", default="time")
-    ap.add_argument("--tz_in", default="auto")
-    ap.add_argument("--assume_utc_if_naive", action="store_true")
-
+    ap.add_argument("--frozen_config", required=True)
     ap.add_argument("--execution_policy", required=True)
     ap.add_argument("--state_path", required=True)
     ap.add_argument("--override_path", required=True)
@@ -419,28 +380,23 @@ def main() -> None:
     ap.add_argument("--results_dir", default="results/runs")
     ap.add_argument("--run_tag", default=None)
 
-    ap.add_argument("--anchor_col", default="ny_open")
-    ap.add_argument("--entry_threshold_pips", type=float, default=8.0)
-    ap.add_argument("--exit_threshold_pips", type=float, default=0.0)
-    ap.add_argument("--sl_pips", type=float, default=20.0)
-    ap.add_argument("--tp_pips", type=float, default=12.0)
-    ap.add_argument("--warmup_bars", type=int, default=0)
-    ap.add_argument("--max_hold_bars", type=int, default=24)
-    ap.add_argument("--pip_size", type=float, default=0.0001)
+    ap.add_argument("--csv", default=None)
+    ap.add_argument("--time_col", default="time")
 
-    # policy gate file (freeze YAML)
-    ap.add_argument("--policy_gate", default=None)
-
-    # LIVE: choose mode
-    ap.add_argument("--mode", choices=["batch", "paper_live"], default="batch")
+    # live tail
     ap.add_argument("--poll_seconds", type=float, default=1.0)
     ap.add_argument("--start_from_last_row", action="store_true")
 
     args = ap.parse_args()
 
-    # Create run dir + logs early
+    frozen = load_config(args.frozen_config)
+    exec_cfg = load_config(args.execution_policy)
+    ep, meta, dbg = _resolve_execution_policy(exec_cfg)
+
+    frozen_hash = file_sha256(args.frozen_config)
     policy_hash = file_sha256(args.execution_policy)
-    run_id = make_run_id(args.run_tag, policy_hash)
+
+    run_id = make_run_id(args.run_tag, f"{frozen_hash}_{policy_hash}")
     run_dir = Path(args.results_dir) / run_id
     ensure_dir(str(run_dir))
 
@@ -454,47 +410,28 @@ def main() -> None:
     }
 
     append_log(paths["logs"], f"[{utc_now_iso()}] run_id={run_id}")
-    append_log(paths["logs"], f"[{utc_now_iso()}] mode={args.mode}")
-    append_log(paths["logs"], f"[{utc_now_iso()}] execution_policy_path={args.execution_policy}")
+    append_log(paths["logs"], f"[{utc_now_iso()}] frozen_config={args.frozen_config}")
+    append_log(paths["logs"], f"[{utc_now_iso()}] frozen_sha256={frozen_hash}")
+    append_log(paths["logs"], f"[{utc_now_iso()}] execution_policy={args.execution_policy}")
     append_log(paths["logs"], f"[{utc_now_iso()}] execution_policy_sha256={policy_hash}")
-    append_log(paths["logs"], f"[{utc_now_iso()}] csv={args.csv}")
-
-    append_log(
-        paths["logs"],
-        f"[{utc_now_iso()}] weekend_flatten tz=America/New_York cutoff={WEEKEND_CUTOFF_NY.strftime('%H:%M:%S')} (Friday)",
-    )
-
-    exec_cfg = load_config(args.execution_policy)
-    ep, meta, dbg = _resolve_execution_policy(exec_cfg)
-
     append_log(paths["logs"], f"[{utc_now_iso()}] exec_cfg_shape={dbg.get('exec_cfg_shape')}")
     append_log(paths["logs"], f"[{utc_now_iso()}] policy_shape_selected={dbg.get('selected')}")
-    append_log(paths["logs"], f"[{utc_now_iso()}] ep_shape={_shape_hint(ep)}")
-    append_log(paths["logs"], f"[{utc_now_iso()}] meta_shape={dbg.get('meta_shape')}")
 
-    policy_name = str(meta.get("name", ep.get("name", "UNKNOWN_POLICY_NAME")))
-    append_log(paths["logs"], f"[{utc_now_iso()}] policy_name={policy_name} account_mode={args.account_mode}")
-
-    # Required sections (strict)
-    if "internal_limits" not in ep:
-        raise KeyError("internal_limits not found in execution policy (see logs.txt)")
-    if "order_execution" not in ep:
-        raise KeyError("order_execution not found in execution policy (see logs.txt)")
-    if "risk_mode" not in ep:
-        raise KeyError("risk_mode not found in execution policy (see logs.txt)")
-    if "throttle" not in ep:
-        raise KeyError("throttle not found in execution policy (see logs.txt)")
+    for k in ("internal_limits", "order_execution", "risk_mode", "throttle"):
+        if k not in ep:
+            raise KeyError(f"{k} not found in execution policy (check logs.txt for shape)")
 
     tz_name = str(meta.get("timezone_day_rollover", ep.get("timezone_day_rollover", "Europe/Prague")))
-    instrument = str(meta.get("instrument", ep.get("instrument", "EURUSD")))
+    instrument = str(meta.get("instrument", ep.get("instrument", frozen.get("symbol", "EURUSD"))))
+    policy_name = str(meta.get("name", ep.get("name", ep.get("execution_policy", {}).get("name", "UNKNOWN_POLICY"))))
 
     max_daily_loss_pct = float(ep["internal_limits"]["daily_stop_pct"]) * 100.0
     max_overall_loss_pct = float(ep["internal_limits"]["hard_stop_total_dd_pct"]) * 100.0
 
     oe = ep["order_execution"]
+    fill_mode = oe.get("fill_mode", "next_open")
     intrabar_path_mode = oe["intrabar"]["path_mode"]
     intrabar_tie_break = oe["intrabar"]["tie_break"]
-    fill_mode = oe.get("fill_mode", "next_open")
 
     trade_controls = ep.get("trade_controls", {})
     max_trades_per_day = int(trade_controls.get("max_trades_per_day", 1))
@@ -503,6 +440,7 @@ def main() -> None:
     if pnl_mode not in ("absolute", "return"):
         pnl_mode = "absolute"
 
+    append_log(paths["logs"], f"[{utc_now_iso()}] policy_name={policy_name} account_mode={args.account_mode}")
     append_log(paths["logs"], f"[{utc_now_iso()}] tz_day_rollover={tz_name}")
     append_log(
         paths["logs"],
@@ -513,8 +451,74 @@ def main() -> None:
         f"[{utc_now_iso()}] order_execution fill_mode={fill_mode} intrabar_path={intrabar_path_mode} tie={intrabar_tie_break}",
     )
     append_log(paths["logs"], f"[{utc_now_iso()}] trade_controls max_trades_per_day={max_trades_per_day} pnl_mode={pnl_mode}")
+    append_log(
+        paths["logs"],
+        f"[{utc_now_iso()}] weekend_flatten tz=America/New_York cutoff={WEEKEND_CUTOFF_NY.strftime('%H:%M:%S')} (Friday)",
+    )
 
-    # Risk manager
+    csv_path = args.csv or str(frozen.get("data_path"))
+    if not csv_path:
+        raise ValueError("CSV path is missing: provide --csv or ensure frozen config has data_path")
+
+    prov = TailCSVBarProvider(
+        TailCSVConfig(
+            csv_path=csv_path,
+            time_col=args.time_col,
+            open_col="open",
+            high_col="high",
+            low_col="low",
+            close_col="close",
+            tick_volume_col="tick_volume",
+            poll_seconds=float(args.poll_seconds),
+            start_from_last_row=bool(args.start_from_last_row),
+        )
+    )
+    append_log(
+        paths["logs"],
+        f"[{utc_now_iso()}] paper_live tail_config poll_seconds={args.poll_seconds} start_from_last_row={bool(args.start_from_last_row)}",
+    )
+
+    engine = PaperEngine(
+        intrabar_path=intrabar_path_mode,
+        tie_break=intrabar_tie_break,
+        allow_same_bar_exit=True,
+    )
+
+    strat_cfg = frozen.get("strategy", {}) or {}
+    params = strat_cfg.get("params", {}) or {}
+
+    anchor_col = str(params.get("anchor_col", "ny_open"))
+    warmup_bars = int(params.get("warmup_bars", 0))
+    entry_threshold_pips = float(params.get("entry_threshold_pips", 8.0))
+    exit_threshold_pips = float(params.get("exit_threshold_pips", 0.3))
+    sl_pips = float(params.get("sl_pips", 10.0))
+    tp_pips = float(params.get("tp_pips", 15.0))
+    max_hold_bars = int(params.get("max_hold_bars", params.get("max_hold", params.get("max_holding_bars", 96))))
+
+    pip_size = float((frozen.get("instrument", {}) or {}).get("pip_size", 0.0001))
+
+    strat = AnchorReversionAdapter(
+        AnchorAdapterConfig(
+            anchor_col=anchor_col,
+            entry_threshold_pips=entry_threshold_pips,
+            exit_threshold_pips=exit_threshold_pips,
+            sl_pips=sl_pips,
+            tp_pips=tp_pips,
+            warmup_bars=warmup_bars,
+            max_hold_bars=max_hold_bars,
+            tag=str(params.get("tag", "ANCHOR_ADAPTER_FROZEN")),
+        )
+    )
+
+    gate: Optional[PolicyGate] = None
+    policy_gate_path = None
+    if isinstance(frozen.get("policy_gate"), dict):
+        policy_gate_path = frozen["policy_gate"].get("policy_path")
+    if policy_gate_path:
+        gate_cfg = load_config(policy_gate_path)
+        gate = PolicyGate(gate_cfg)
+        append_log(paths["logs"], f"[{utc_now_iso()}] policy_gate_enabled path={policy_gate_path} policy_id={gate.policy_id}")
+
     rsm = RiskStateManager(
         state_path=args.state_path,
         override_path=args.override_path,
@@ -531,67 +535,6 @@ def main() -> None:
     state["max_trades_per_day"] = max_trades_per_day
     rsm.save_state(state)
 
-    # Provider selection (batch vs paper_live)
-    if args.mode == "batch":
-        prov = CSVBarProvider(
-            CSVProviderConfig(
-                csv_path=args.csv,
-                time_col=args.time_col,
-                open_col="open",
-                high_col="high",
-                low_col="low",
-                close_col="close",
-                volume_col=None,
-                tz_in=args.tz_in,
-                assume_utc_if_naive=args.assume_utc_if_naive,
-            )
-        )
-    else:
-        prov = TailCSVBarProvider(
-            TailCSVConfig(
-                csv_path=args.csv,
-                time_col=args.time_col,
-                open_col="open",
-                high_col="high",
-                low_col="low",
-                close_col="close",
-                tick_volume_col="tick_volume",
-                poll_seconds=float(args.poll_seconds),
-                start_from_last_row=bool(args.start_from_last_row),
-            )
-        )
-        append_log(
-            paths["logs"],
-            f"[{utc_now_iso()}] paper_live tail_config poll_seconds={args.poll_seconds} start_from_last_row={bool(args.start_from_last_row)}",
-        )
-
-    engine = PaperEngine(
-        intrabar_path=intrabar_path_mode,
-        tie_break=intrabar_tie_break,
-        allow_same_bar_exit=True,
-    )
-
-    # Strategy (adapter)
-    strat = AnchorReversionAdapter(
-        AnchorAdapterConfig(
-            anchor_col=args.anchor_col,
-            entry_threshold_pips=args.entry_threshold_pips,
-            exit_threshold_pips=args.exit_threshold_pips,
-            sl_pips=args.sl_pips,
-            tp_pips=args.tp_pips,
-            warmup_bars=args.warmup_bars,
-            max_hold_bars=args.max_hold_bars,
-            tag="ANCHOR_ADAPTER_V1",
-        )
-    )
-
-    # Optional policy gate
-    gate: Optional[PolicyGate] = None
-    if args.policy_gate:
-        gate_cfg = load_config(args.policy_gate)
-        gate = PolicyGate(gate_cfg)
-        append_log(paths["logs"], f"[{utc_now_iso()}] policy_gate_enabled path={args.policy_gate} policy_id={gate.policy_id}")
-
     r_base = float(ep["risk_mode"][args.account_mode]["base_risk_pct_per_trade"]) / 100.0
     throttle_schedule = ep["throttle"]["schedule"]
 
@@ -601,14 +544,17 @@ def main() -> None:
         "run_id": run_id,
         "started_at_utc": utc_now_iso(),
         "ended_at_utc": None,
-        "mode": "paper_live" if args.mode == "paper_live" else "paper",
+        "mode": "paper_live",
         "account_mode": args.account_mode,
         "instrument": instrument,
         "policy_name": policy_name,
+        "frozen_config_path": args.frozen_config,
+        "frozen_config_sha256": frozen_hash,
         "execution_policy_path": args.execution_policy,
         "execution_policy_sha256": policy_hash,
         "state_path": args.state_path,
         "override_path": args.override_path,
+        "csv": csv_path,
         "engine": {
             "fill_mode": fill_mode,
             "intrabar_path": intrabar_path_mode,
@@ -622,14 +568,24 @@ def main() -> None:
             },
             "trade_controls": {"max_trades_per_day": max_trades_per_day},
             "live_tail": {
-                "enabled": bool(args.mode == "paper_live"),
+                "enabled": True,
                 "poll_seconds": float(args.poll_seconds),
                 "start_from_last_row": bool(args.start_from_last_row),
             },
         },
+        "strategy": {
+            "anchor_col": anchor_col,
+            "entry_threshold_pips": entry_threshold_pips,
+            "exit_threshold_pips": exit_threshold_pips,
+            "sl_pips": sl_pips,
+            "tp_pips": tp_pips,
+            "warmup_bars": warmup_bars,
+            "max_hold_bars": max_hold_bars,
+            "pip_size": pip_size,
+        },
         "gate": {
             "enabled": bool(gate is not None),
-            "policy_gate_path": args.policy_gate,
+            "policy_gate_path": policy_gate_path,
             "policy_id": getattr(gate, "policy_id", None),
             "gate_allow": 0,
             "gate_block": 0,
@@ -646,15 +602,13 @@ def main() -> None:
             "day_rollovers": 0,
             "intent_cancels": 0,
         },
-        "summary": None,  # filled at end (batch only)
+        "summary": None,
     }
     write_json(paths["manifest"], manifest)
 
     def close_and_persist(trade, bar_ts_utc: datetime, reason_hint: str) -> None:
         nonlocal state
 
-        # NOTE: hook should happen AFTER persistence, but keeping your existing order is ok
-        # as long as the adapter's internal state resets on close.
         if hasattr(strat, "on_trade_closed_reset"):
             strat.on_trade_closed_reset()
 
@@ -667,7 +621,6 @@ def main() -> None:
         state = rsm.on_trade_closed(state, equity_after=equity_after, run_id=run_id, now_utc=bar_ts_utc)
         rsm.save_state(state)
 
-        # Persist FTMO day_id as the DAY OF ENTRY, not close.
         entry_day_id = None
         try:
             entry_day_id = (getattr(trade, "meta", None) or {}).get("_day_id_ftmo_entry")
@@ -704,12 +657,8 @@ def main() -> None:
             f"[{utc_now_iso()}] CLOSE trade_id={trade.trade_id} reason={trade.exit_reason} pnl={trade.pnl:.6f} R={trade.R:.3f} {reason_hint}",
         )
 
-    last_bar = None  # needed for FORCE_EOF (batch mode only)
-
     try:
-        bar_iter = prov.iter_bars() if args.mode == "batch" else prov.iter_bars_live()
-        for bar in bar_iter:
-            last_bar = bar
+        for bar in prov.iter_bars_live():
             manifest["events"]["bars"] += 1
 
             state = rsm.load_state()
@@ -740,17 +689,11 @@ def main() -> None:
                 day_id_ftmo=day_id,
             )
 
-            # ------------------------------------------------------------
             # WEEKEND FLATTEN / CUTOFF
-            # ------------------------------------------------------------
             if _is_weekend_cutoff(bar.ts_utc):
                 if engine.has_open_position():
                     append_log(paths["logs"], f"[{utc_now_iso()}] WEEKEND_CUTOFF open_position=True -> FORCE_WEEKEND close")
-                    closed = engine.force_close(
-                        ts_utc=bar.ts_utc,
-                        price=float(bar.close),
-                        reason="FORCE_WEEKEND",
-                    )
+                    closed = engine.force_close(ts_utc=bar.ts_utc, price=float(bar.close), reason="FORCE_WEEKEND")
                     if closed is not None:
                         manifest["events"]["forced_exits"] += 1
                         manifest["events"]["weekend_forced_exits"] += 1
@@ -758,18 +701,11 @@ def main() -> None:
                     continue
 
                 if engine.has_pending_intent() and (not engine.has_open_position()):
-                    # cancel pending intent if possible
-                    if hasattr(engine, "cancel_pending_intent"):
-                        engine.cancel_pending_intent(reason="WEEKEND_CUTOFF_CANCEL")
-                        manifest["events"]["intent_cancels"] += 1
-                        append_log(paths["logs"], f"[{utc_now_iso()}] WEEKEND_CUTOFF pending_intent=True -> CANCEL")
-                    else:
-                        append_log(paths["logs"], f"[{utc_now_iso()}] WEEKEND_CUTOFF pending_intent=True (no cancel API)")
-
-                    # >>> IMPORTANT: adapter hook
+                    engine.cancel_pending_intent(reason="WEEKEND_CUTOFF_CANCEL")
+                    manifest["events"]["intent_cancels"] += 1
+                    append_log(paths["logs"], f"[{utc_now_iso()}] WEEKEND_CUTOFF pending_intent=True -> CANCEL")
                     if hasattr(strat, "on_intent_cancelled"):
                         strat.on_intent_cancelled()
-
                     continue
 
                 continue
@@ -782,22 +718,17 @@ def main() -> None:
                 trading_enabled=bool(state.get("trading_enabled", True)),
                 account_mode=args.account_mode,
                 instrument=instrument,
-                pip_size=float(args.pip_size),
+                pip_size=float(pip_size),
             )
 
-            # ------------------------------------------------------------
-            # Pending intent path (fill at next_open)
-            # ------------------------------------------------------------
+            # Pending intent path
             if engine.has_pending_intent() and (not engine.has_open_position()):
                 closed = engine.on_bar(bar)
 
-                # Case A: pending -> fill+close same bar (engine returns a Trade)
                 if closed is not None:
                     manifest["events"]["fills"] += 1
-
-                    # >>> IMPORTANT: adapter hook (fill confirmed) - pass entry_ts_utc
                     if hasattr(strat, "on_trade_opened_confirmed"):
-                        strat.on_trade_opened_confirmed(entry_ts_utc=bar.ts_utc)
+                        strat.on_trade_opened_confirmed(bar.ts_utc)
 
                     state = rsm.load_state()
                     state = rsm.on_trade_opened(state, run_id=run_id, now_utc=bar.ts_utc)
@@ -806,13 +737,10 @@ def main() -> None:
                     close_and_persist(closed, bar.ts_utc, reason_hint="(filled+closed)")
                     continue
 
-                # Case B: pending -> filled, now open
                 if engine.has_open_position():
                     manifest["events"]["fills"] += 1
-
-                    # >>> IMPORTANT: adapter hook (fill confirmed) - pass entry_ts_utc
                     if hasattr(strat, "on_trade_opened_confirmed"):
-                        strat.on_trade_opened_confirmed(entry_ts_utc=bar.ts_utc)
+                        strat.on_trade_opened_confirmed(bar.ts_utc)
 
                     state = rsm.load_state()
                     state = rsm.on_trade_opened(state, run_id=run_id, now_utc=bar.ts_utc)
@@ -820,9 +748,7 @@ def main() -> None:
 
                 continue
 
-            # ------------------------------------------------------------
             # Open position path
-            # ------------------------------------------------------------
             if engine.has_open_position():
                 intent = strat.on_bar(bar, ctx)
                 if intent is not None:
@@ -843,9 +769,7 @@ def main() -> None:
                     close_and_persist(closed, bar.ts_utc, reason_hint="(tp/sl)")
                 continue
 
-            # ------------------------------------------------------------
-            # No open position: entry gating by risk state manager
-            # ------------------------------------------------------------
+            # Entry gating by risk state manager
             if not rsm.can_trade(state, run_id=run_id, now_utc=bar.ts_utc):
                 continue
 
@@ -859,9 +783,7 @@ def main() -> None:
             if intent.direction is None or intent.sl_price is None or intent.tp_price is None:
                 continue
 
-            # ------------------------------------------------------------
-            # POLICY GATE — BEFORE risk/throttle
-            # ------------------------------------------------------------
+            # POLICY GATE
             if gate is not None:
                 feats = {
                     gate.shock_col: _bar_feature(bar, gate.shock_col),
@@ -883,9 +805,6 @@ def main() -> None:
                     append_log(paths["logs"], f"[{utc_now_iso()}] POLICY_GATE BLOCK {gmeta}")
                     continue
 
-            # ------------------------------------------------------------
-            # Risk sizing / throttle
-            # ------------------------------------------------------------
             dd_pct = float(state.get("dd_from_peak_pct", 0.0))
             mult = throttle_multiplier_from_schedule(dd_pct, throttle_schedule)
             r_eff = r_base * mult
@@ -898,6 +817,9 @@ def main() -> None:
                     "_day_id_ftmo_entry": day_id,
                     "_dd_at_entry_pct": dd_pct,
                     "_daily_pnl_pct_at_entry": float(state.get("daily_pnl_pct", 0.0)),
+                    "_pip_size": float(pip_size),
+                    "_sl_pips": float(sl_pips),
+                    "_tp_pips": float(tp_pips),
                 },
             )
 
@@ -909,79 +831,45 @@ def main() -> None:
                 f"dir={intent.direction} sl={intent.sl_price} tp={intent.tp_price}"
             )
 
-            # >>> IMPORTANT: adapter hook (intent actually submitted)
             if hasattr(strat, "on_intent_submitted"):
                 strat.on_intent_submitted(intent.direction)
 
             engine.submit_intent(intent, risk_base_pct=r_base, risk_multiplier=mult, risk_effective_pct=r_eff)
             manifest["events"]["entries_submitted"] += 1
 
-        # ------------------------------------------------------------
-        # EOF HANDLING (batch only)
-        # ------------------------------------------------------------
-        if args.mode == "batch":
-            if last_bar is not None and engine.has_open_position():
-                append_log(paths["logs"], f"[{utc_now_iso()}] EOF_DETECTED open_position=True -> FORCE_EOF close")
-                closed = engine.force_close(
-                    ts_utc=last_bar.ts_utc,
-                    price=float(last_bar.close),
-                    reason="FORCE_EOF",
-                )
-                if closed is not None:
-                    manifest["events"]["forced_exits"] += 1
-                    close_and_persist(closed, last_bar.ts_utc, reason_hint="(forced_eof)")
-                else:
-                    append_log(paths["logs"], f"[{utc_now_iso()}] EOF_FORCE_CLOSE returned None (unexpected)")
-
-            if last_bar is not None and engine.has_pending_intent() and (not engine.has_open_position()):
-                append_log(
-                    paths["logs"],
-                    f"[{utc_now_iso()}] EOF_DETECTED pending_intent=True open_position=False (intent not filled before EOF)",
-                )
-
-    except DataValidationError as e:
-        append_log(paths["logs"], f"[{utc_now_iso()}] DATA_VALIDATION_ERROR: {e}")
-        raise
+    except KeyboardInterrupt:
+        append_log(paths["logs"], f"[{utc_now_iso()}] STOP KeyboardInterrupt received; shutting down runner.")
     finally:
-        # finalize manifest timestamps
         manifest["ended_at_utc"] = utc_now_iso()
 
-        # In paper_live we keep manifest audit but skip end-of-run summary to avoid
-        # interpreting a still-growing trades.csv as "final".
-        if args.mode == "batch":
-            # end-of-run state snapshot
-            try:
-                st = rsm.load_state()
-            except Exception:
-                st = {}
+        # Snapshot final state (no “final metrics” in live, but this is useful)
+        try:
+            st = rsm.load_state()
+        except Exception:
+            st = {}
 
-            # build summary from trades.csv (single source of truth for realized outcomes)
-            summary = summarize_trades_csv(paths["trades"]) if Path(paths["trades"]).exists() else {"n_trades": 0}
-
-            # enrich with final risk/equity stats (from state)
-            summary["final_state"] = {
+        manifest["summary"] = {
+            "n_trades": None,
+            "final_state": {
                 "equity_current": float(st.get("equity_current", 0.0)) if isinstance(st, dict) else 0.0,
                 "equity_peak": float(st.get("equity_peak", 0.0)) if isinstance(st, dict) else 0.0,
                 "dd_from_peak_pct": float(st.get("dd_from_peak_pct", 0.0)) if isinstance(st, dict) else 0.0,
                 "daily_pnl_pct": float(st.get("daily_pnl_pct", 0.0)) if isinstance(st, dict) else 0.0,
                 "daily_stop_triggered": bool(st.get("daily_stop_triggered", False)) if isinstance(st, dict) else False,
                 "hard_stop_dd_triggered": bool(st.get("hard_stop_dd_triggered", False)) if isinstance(st, dict) else False,
-            }
+            },
+        }
+        write_json(paths["manifest"], manifest)
 
-            # attach summary to manifest and persist
-            manifest["summary"] = summary
-            write_json(paths["manifest"], manifest)
+        # OPTIONAL: you can write a rolling metrics snapshot if you want
+        try:
+            summary = summarize_trades_csv(paths["trades"])
+            summary["final_state"] = manifest["summary"]["final_state"]
+            write_json(paths["metrics"], summary)
+        except Exception as e:
+            append_log(paths["logs"], f"[{utc_now_iso()}] METRICS_WRITE_ERROR: {e}")
 
-            # also persist metrics.json (stable single-file summary)
-            try:
-                write_json(paths["metrics"], summary)
-            except Exception as e:
-                append_log(paths["logs"], f"[{utc_now_iso()}] METRICS_WRITE_ERROR: {e}")
-        else:
-            # paper_live: write manifest without summary to avoid implying run completion metrics
-            write_json(paths["manifest"], manifest)
-
-    print(f"Run completed: {run_dir}")
+    print(f"Runner stopped: {run_dir}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,48 @@
+execution_policy:
+  name: FTMO_Anchor_Policy_v2_25k_2step
+  instrument: EURUSD
+  strategy: AnchorMR
+  account_type: FTMO_2_Step
+  timezone_day_rollover: Europe/Prague
+
+internal_limits:
+  daily_stop_pct: 0.015
+  hard_stop_total_dd_pct: 0.08
+
+order_execution:
+  fill_mode: next_open
+  intrabar:
+    path_mode: OHLC
+    tie_break: sl_first
+  costs:
+    spread_pips: 1.0
+    slippage_pips: 0.2
+
+risk_mode:
+  challenge:
+    base_risk_pct_per_trade: 0.75   # runner/100 => 0.0075
+  verification:
+    base_risk_pct_per_trade: 0.50   # runner/100 => 0.0050
+  funded:
+    base_risk_pct_per_trade: 0.40
+
+throttle:
+  type: dd_based
+  schedule:
+    - dd_min_pct: 0.0
+      dd_max_pct: 6.0
+      risk_multiplier: 1.00
+    - dd_min_pct: 6.0
+      dd_max_pct: 8.0
+      risk_multiplier: 0.67
+    - dd_min_pct: 8.0
+      dd_max_pct: 1.0e9
+      risk_multiplier: 0.00
+
+trade_controls:
+  max_trades_per_day: 1
+  allow_multiple_positions: false
+  reentry_same_day: false
+
+paper:
+  pnl_mode: absolute

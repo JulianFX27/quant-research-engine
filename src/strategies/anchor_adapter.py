@@ -68,13 +68,13 @@ class AnchorReversionAdapter:
     """
 
     name = "AnchorReversionAdapter"
-    version = "0.3.2"  # bumped due to TIME_STOP semantics fix
+    version = "0.3.4"  # bump: warmup no longer breaks day/event tracking
     instrument = "EURUSD"
 
     def __init__(self, cfg: Optional[AnchorAdapterConfig] = None):
         self.cfg = cfg or AnchorAdapterConfig()
 
-        self._i = -1  # global bar counter (for debugging only; NOT authoritative for TIME_STOP)
+        self._i = -1  # global bar counter (debug only)
 
         # Runner/engine state via hooks
         self._pending = False
@@ -106,13 +106,6 @@ class AnchorReversionAdapter:
     # -----------------------------
     @staticmethod
     def _to_float_or_none(x: Any) -> Optional[float]:
-        """
-        Robust float parsing:
-        - None -> None
-        - '' / whitespace -> None
-        - non-numeric -> None
-        - NaN -> None
-        """
         if x is None:
             return None
         if isinstance(x, str) and x.strip() == "":
@@ -138,13 +131,6 @@ class AnchorReversionAdapter:
         return cutoff_minutes - now_minutes
 
     def _roll_day_if_needed(self, bar: Bar) -> None:
-        """
-        Maintain a day-local bar counter for NY days.
-
-        day-local counters are for event conditioning only.
-        TIME_STOP must NOT rely on day-local counters (they reset), and must NOT rely on
-        global bar counts either if the dataset is session-filtered (gaps).
-        """
         day = self._day_id_ny(bar.ts_utc)
         if self._day_id is None or day != self._day_id:
             self._day_id = day
@@ -156,17 +142,12 @@ class AnchorReversionAdapter:
             self._event_ts_utc = None
             self._traded_event_i_day = None
 
-            # Reset entry index within day ONLY if no open position
             if not self._in_pos:
                 self._entry_i_day = None
         else:
             self._day_i += 1
 
     def _update_event_state(self, bar: Bar) -> None:
-        """
-        Update latest event within current NY-day using day-local index.
-        Latest event wins.
-        """
         cfg = self.cfg
         if not cfg.require_event:
             return
@@ -205,13 +186,6 @@ class AnchorReversionAdapter:
         return True
 
     def _effective_hold_bars(self) -> int:
-        """
-        Bound hold bars so a trade cannot survive beyond the event window.
-
-        This returns a FIXED bar budget computed at entry fill time.
-        TIME_STOP enforcement itself is wall-clock minutes (hold_budget_minutes),
-        but we keep bars for alignment/audit and to derive minutes.
-        """
         cfg = self.cfg
         base = int(cfg.max_hold_bars) if cfg.max_hold_bars > 0 else 0
 
@@ -257,9 +231,7 @@ class AnchorReversionAdapter:
         self._i += 1
         cfg = self.cfg
 
-        if self._i < int(cfg.warmup_bars):
-            return None
-
+        # IMPORTANT: warmup must NOT break day rollover / event tracking.
         self._roll_day_if_needed(bar)
         self._update_event_state(bar)
 
@@ -272,11 +244,8 @@ class AnchorReversionAdapter:
         extras = getattr(bar, "extras", None) or {}
         anchor = self._to_float_or_none(extras.get(cfg.anchor_col, None))
 
-        # --------------------
-        # EXIT logic
-        # --------------------
+        # EXIT (never blocked by warmup)
         if self._in_pos:
-            # TIME_STOP must be WALL-CLOCK to be robust to session-filtered datasets / gaps.
             if self._entry_ts_utc is not None and self._hold_budget_minutes is not None and int(self._hold_budget_minutes) > 0:
                 held_min = (bar.ts_utc - self._entry_ts_utc).total_seconds() / 60.0
                 if held_min >= float(self._hold_budget_minutes):
@@ -304,15 +273,15 @@ class AnchorReversionAdapter:
 
             return None
 
-        # --------------------
+        # Warmup blocks only entries (tracking already updated above)
+        if self._i < int(cfg.warmup_bars):
+            return None
+
         # No entries if pending
-        # --------------------
         if self._pending:
             return None
 
-        # --------------------
         # ENTRY filters
-        # --------------------
         if cfg.require_event and (not self._event_allows_entry()):
             return None
 
@@ -383,21 +352,21 @@ class AnchorReversionAdapter:
         self._pending = True
         self._side = direction
 
-    def on_trade_opened_confirmed(self, entry_ts_utc: datetime) -> None:
+    def on_trade_opened_confirmed(self, entry_ts_utc: Optional[datetime] = None) -> None:
         """
         Called after the engine confirms the trade entry fill.
 
-        Critical:
-        - Capture ENTRY TIME (fill time) for wall-clock TIME_STOP.
-        - Capture day-local entry index only to compute fixed budgets at entry.
-        - Persist hold budgets so day rollover cannot disable TIME_STOP.
+        Defensive:
+        - If entry_ts_utc is missing, we keep TIME_STOP disabled (safe) until next correct call.
         """
         self._in_pos = True
         self._pending = False
-        self._entry_ts_utc = entry_ts_utc
+
+        if entry_ts_utc is not None:
+            self._entry_ts_utc = entry_ts_utc
+
         self._entry_i_day = int(self._day_i)
 
-        # Freeze budgets at entry (bounded by event window)
         self._hold_budget_bars = int(self._effective_hold_bars())
         self._hold_budget_minutes = self._bars_to_minutes(int(self._hold_budget_bars))
 

@@ -97,14 +97,30 @@ class PaperEngine:
         return self._open_trade
 
     # ----------------------------
+    # Pending intent cancel (safety)
+    # ----------------------------
+    def cancel_pending_intent(self, reason: str = "CANCELLED") -> None:
+        """
+        Cancel a staged intent that has not been filled yet.
+        Safe no-op if none exists.
+        """
+        if self._pending_intent is None:
+            return
+        # Keep a tiny audit trail in meta if you ever persist the intent elsewhere
+        try:
+            if self._pending_intent.meta is not None:
+                self._pending_intent.meta["_cancel_reason"] = str(reason)
+        except Exception:
+            pass
+
+        self._pending_intent = None
+        self._pending_risk = None
+
+    # ----------------------------
     # Mark-to-market helpers
     # ----------------------------
     @staticmethod
     def compute_unrealized_R(tr: Trade, price: float) -> float:
-        """
-        Compute floating R-multiple at a given price (no costs).
-        R_multiple = raw / risk_unit
-        """
         px = float(price)
 
         if tr.direction == "LONG":
@@ -121,10 +137,6 @@ class PaperEngine:
 
     @staticmethod
     def compute_unrealized_pnl(tr: Trade, price: float) -> float:
-        """
-        Floating PnL in equity-space units, consistent with Trade.pnl:
-          pnl_unreal = risk_effective_pct * R_multiple(price)
-        """
         r_mult = PaperEngine.compute_unrealized_R(tr, price=float(price))
         return float(tr.risk_effective_pct * r_mult)
 
@@ -139,14 +151,6 @@ class PaperEngine:
         risk_multiplier: float,
         risk_effective_pct: float,
     ) -> None:
-        """
-        Stage an intent to be filled at the next bar open.
-
-        Caller must ensure:
-        - no open position
-        - no pending intent
-        - risk_effective_pct > 0
-        """
         if self._open_trade is not None:
             raise PaperExecutionError("Cannot submit intent: position already open.")
         if self._pending_intent is not None:
@@ -165,17 +169,6 @@ class PaperEngine:
     # Engine step (bar-by-bar)
     # ----------------------------
     def on_bar(self, bar: Bar) -> Optional[Trade]:
-        """
-        Advance engine by one bar.
-
-        Returns:
-        - Trade if a trade CLOSED on this bar
-        - None otherwise
-
-        Behavior order:
-        1) If pending intent and no open position -> fill at bar open.
-        2) If open position -> check intrabar for SL/TP.
-        """
         closed_trade: Optional[Trade] = None
 
         # 1) Fill pending intent at bar open
@@ -221,11 +214,9 @@ class PaperEngine:
 
         meta = dict(intent.meta or {})
 
-        # Default: use provided absolute SL/TP
         sl_price = float(intent.sl_price) if intent.sl_price is not None else None
         tp_price = float(intent.tp_price) if intent.tp_price is not None else None
 
-        # Optional: recompute SL/TP at fill based on pips (freeze-compatible)
         recalc = bool(meta.get("_recalc_sl_tp_at_fill", False))
         sl_pips = meta.get("_sl_pips", None)
         tp_pips = meta.get("_tp_pips", None)
@@ -250,7 +241,6 @@ class PaperEngine:
             meta["_tp_price_filled"] = float(tp_price)
             meta["_entry_price_filled"] = float(entry_price)
 
-        # Hard validation: SL must be on correct side of entry
         if sl_price is None or tp_price is None:
             raise PaperExecutionError("Intent missing SL/TP (sl_price/tp_price must be set).")
 
@@ -267,7 +257,6 @@ class PaperEngine:
                     f"entry={entry_price:.6f} sl={sl_price:.6f} tp={tp_price:.6f}"
                 )
 
-        # Risk price contract
         risk_price = abs(entry_price - float(sl_price))
         if risk_price <= 0:
             raise PaperExecutionError("Invalid risk_price (entry == SL).")
@@ -287,7 +276,6 @@ class PaperEngine:
             meta=meta,
         )
 
-        # clear pending
         self._pending_intent = None
         self._pending_risk = None
 
