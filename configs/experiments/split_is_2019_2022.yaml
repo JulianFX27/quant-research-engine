@@ -1,0 +1,4 @@
+data:
+  time_range:
+    start: "2019-01-01"
+    end:   "2022-12-31"

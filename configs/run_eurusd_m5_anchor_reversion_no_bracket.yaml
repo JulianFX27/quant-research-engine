@@ -1,0 +1,42 @@
+# configs/run_eurusd_m5_anchor_reversion_no_bracket.yaml
+
+data_path: "data/anchor_reversion_fx/data/eurusd_m5_features.csv"
+
+data:
+  time_col: "time"
+  tz: "UTC"
+  sort: true
+
+strategy:
+  name: "AnchorReversionFXNoBracket"
+  params:
+    qty: 1.0
+    anchor_col: "ny_open"
+    entry_threshold_price: 0.0008      # 8 pips ~ 0.0008
+    exit_threshold_price: 0.0000
+    max_hold_bars: 288                 # 24h en M5 (recomendado para evitar trades eternos)
+    warmup_bars: 0
+    tag: "AnchorReversionFXNoBracket"
+
+execution:
+  fill_mode: "close"
+  intrabar_path: "OHLC"
+  intrabar_tie: "sl_first"
+
+costs:
+  spread_price: 0.00010                # 1 pip en EURUSD ~ 0.0001
+  slippage_price: 0.0
+  commission: 0.0
+
+risk:
+  allow_missing_sl: true
+  risk_proxy_price: 0.0010             # 10 pips como “1R” proxy (ajústalo si quieres)
+  force_exit_on_eof: true              # si dejas max_hold_bars, esto no debería activarse casi nunca
+  max_holding_bars: 0
+  eof_buffer_bars: 0
+  cooldown_bars: 0
+  max_daily_loss_R: null
+  max_trades_per_day: null
+
+regime_fx:
+  enabled: false

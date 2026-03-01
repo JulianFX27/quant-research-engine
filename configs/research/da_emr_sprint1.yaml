@@ -1,0 +1,39 @@
+# configs/research/da_emr_sprint1.yaml
+
+dataset:
+  instrument: "EURUSD"
+  timeframe: "M5"
+  dataset_id: "..."   # el que ya uses en tu dataset registry
+
+execution:
+  fill_mode: "next_open"
+  # ... tus costs actuales
+
+regime_fx:
+  enabled: true
+  config_path: "configs/regime_fx.yaml"
+  warmup_bars: 300
+
+strategy:
+  name: "DA_EMR"
+  anchor:
+    day_boundary: "UTC_00:00"
+    type: "twap"
+    price_col: "close"
+  features:
+    atr_lookback: 48
+    z_window: 240
+  entry_grid:
+    Z_entry: [1.5, 2.0, 2.5]
+    D_entry: [1.0, 1.25, 1.5, 1.75]
+    confirm_rule: ["bar_contra", "elasticity_reducing"]
+  gating:
+    regime_col: "state_regime"
+    allowed: ["RANGE"]
+
+exits:
+  tp_mode: "to_anchor"
+  tp_anchor_buffer_atr_frac: 0.05
+  sl_mode: "atr_mult"
+  sl_atr_mult: 0.8
+  time_stop_bars: 24

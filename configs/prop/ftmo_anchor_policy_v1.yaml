@@ -1,0 +1,85 @@
+execution_policy:
+  name: FTMO_Anchor_Policy_v1
+  instrument: EURUSD
+  strategy: AnchorMR
+  account_type: FTMO_2_Step
+  timezone_day_rollover: Europe/Prague
+
+# Enforced by RiskStateManager via runner -> RiskConfig (LOSS LIMITS as positive %)
+internal_limits:
+  daily_stop_pct: 0.015              # 1.5% daily LOSS stop (internal)
+  hard_stop_total_dd_pct: 0.08       # 8.0% total LOSS stop (internal)
+
+order_execution:
+  fill_mode: next_open
+  intrabar:
+    path_mode: OHLC
+    tie_break: sl_first
+  costs:
+    spread_pips: 1.0
+    slippage_pips: 0.2
+
+risk_mode:
+  challenge:
+    base_risk_pct_per_trade: 0.75    # <-- CAMBIO (antes 1.00)
+  funded:
+    base_risk_pct_per_trade: 0.75    # <-- CAMBIO (antes 0.40)
+
+throttle:
+  type: dd_based
+  schedule:
+    - dd_min_pct: 0.0
+      dd_max_pct: 3.0
+      risk_multiplier: 1.00
+    - dd_min_pct: 3.0
+      dd_max_pct: 5.0
+      risk_multiplier: 0.80
+    - dd_min_pct: 5.0
+      dd_max_pct: 6.5
+      risk_multiplier: 0.60
+    - dd_min_pct: 6.5
+      dd_max_pct: 8.0
+      risk_multiplier: 0.50
+    - dd_min_pct: 8.0
+      dd_max_pct: 1.0e9
+      risk_multiplier: 0.00
+
+trade_controls:
+  max_trades_per_day: 1
+  allow_multiple_positions: false
+  reentry_same_day: false
+
+paper:
+  pnl_mode: return   # <-- MUY IMPORTANTE (compounding FTMO)
+
+policy_reference:
+  assumption:
+    trades_per_day: 1
+    day_rollover: "CEST_00:00"
+
+ftmo_reference_rules:
+  max_loss_total:
+    type: absolute
+    threshold: 0.10
+  max_daily_loss:
+    type: relative
+    threshold: 0.05
+  phase_targets:
+    phase_1: 0.10
+    phase_2: 0.05
+
+promotion:
+  funded_upgrade:
+    condition:
+      min_trades: 25
+      equity_high: true
+      observed_dd_p95: 0.07
+    new_r_base: 0.0075
+
+notes:
+  monte_carlo_reference:
+    bootstrap: block_k5
+    stress_profile: tail
+    p_breach: 0.00
+    p95_max_dd: 0.0591
+    p_stop_internal: 0.0023

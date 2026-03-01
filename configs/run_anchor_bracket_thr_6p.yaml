@@ -1,0 +1,49 @@
+name: anchor_bracket_thr_6p
+symbol: EURUSD
+timeframe: M5
+data_path: data/anchor_reversion_fx/data/eurusd_m5_features.csv
+
+instrument:
+  pip_size: 0.0001
+  data_source: local_csv
+
+costs:
+  commission: 0.0
+  spread_pips: 1.0
+  slippage_pips: 0.0
+
+execution:
+  # IMPORTANTE: para que SL/TP estén bien alineados con el precio de referencia de la estrategia,
+  # usa CLOSE por ahora (evita rechazos por gaps con next_open).
+  fill_mode: close
+  intrabar_path: OHLC
+  intrabar_tie: sl_first
+  entry_delay_bars: 0
+
+risk:
+  force_exit_on_eof: true
+  eof_buffer_bars: 0
+
+  # BRACKET MODE => SL existe, así que NO permitas missing SL
+  allow_missing_sl: false
+
+  max_daily_loss_R: null
+  max_trades_per_day: null
+  cooldown_bars: 0
+
+strategy:
+  name: AnchorReversionFXNoBracket
+  params:
+    qty: 1.0
+    anchor_col: ny_open
+    warmup_bars: 0
+    max_hold_bars: 288
+
+    # ahora SI: threshold en pips (la estrategia lo convierte con pip_size)
+    entry_threshold_pips: 6
+
+    # bracket data-driven (la estrategia emite sl_price/tp_price)
+    sl_pips: 5
+    tp_pips: 15
+
+    tag: AnchorBracket_6p

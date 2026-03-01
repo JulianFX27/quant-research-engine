@@ -1,16 +1,18 @@
-version: "1"
+version: "v0.1.0"
 
-features:
-  er:
-    lookback: 20
-    warmup: "nan"
-  dp:
-    lookback: 20
-    warmup: "nan"
+er:
+  lookback: 12
+
+dp:
+  lookback: 12
 
 thresholds:
-  mode: "artifact"
-  artifact_path: "artifacts/regime_fx_thresholds__eurusd_m5__2022_2024__p30_p70.json"
+  mode: "fixed"
+  fixed:
+    er_trend: 0.60
+    dp_trend: 0.60
+    er_range: 0.30
+    dp_range: 0.30
 
 state_machine:
   enabled: true
@@ -21,9 +23,8 @@ state_machine:
     enabled: true
     margin_frac: 0.10
 
-output:
-  columns:
-    er: "er"
-    dp: "dp"
-    raw_regime: "raw_regime"
-    state_regime: "state_regime"
+output_cols:
+  er: "state_er"
+  dp: "state_dp"
+  raw_regime: "state_raw_regime"
+  state_regime: "state_regime"

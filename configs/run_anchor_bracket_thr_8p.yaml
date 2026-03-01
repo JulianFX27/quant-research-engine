@@ -1,0 +1,49 @@
+name: anchor_mr_pure_thr_8p_v2
+symbol: EURUSD
+timeframe: M5
+data_path: data/anchor_reversion_fx/data/eurusd_m5_features.csv
+
+instrument:
+  pip_size: 0.0001
+  contract_size: 100000
+  data_source: local_csv
+
+costs:
+  spread_pips: 1.0
+  slippage_pips: 0.0
+  commission: 0.0
+
+execution:
+  fill_mode: close          # override con --set execution.fill_mode=next_open cuando compares
+  intrabar_path: OHLC
+  intrabar_tie: sl_first
+  entry_delay_bars: 0
+
+risk:
+  force_exit_on_eof: true
+
+  # Evita trades que queden “colgados” por falta de horizonte al final del dataset
+  validity_mode: strict_no_eof
+  eof_buffer_bars: 300       # >= max_holding_bars (288) + margen
+
+  # ✅ ESTE ES EL KEY QUE TU PIPELINE SÍ CONTEMPLA (vía run.py)
+  guardrails_cfg:
+    max_holding_bars: 288
+
+  # Permite explícitamente el forced-exit por max-hold
+  allowed_forced_exit_reasons:
+    - FORCE_MAX_HOLD
+
+strategy:
+  name: AnchorReversionFXNoBracket
+  params:
+    tag: AnchorMR_Pure_8p_v2
+    qty: 1.0
+    anchor_col: ny_open
+    entry_threshold_pips: 8
+    exit_threshold_price: 0.0
+
+    # (Opcional) Mantén el time-stop interno del strategy también
+    max_hold_bars: 288
+
+    warmup_bars: 0
