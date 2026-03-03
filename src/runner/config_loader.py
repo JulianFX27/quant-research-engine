@@ -1,33 +1,54 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Union
 
-def _read_text(path: str) -> str:
-    return Path(path).read_text(encoding="utf-8")
 
-def load_config(path: str) -> Dict[str, Any]:
-    """
-    Loads YAML if PyYAML is available; otherwise expects JSON.
-    """
-    text = _read_text(path)
-    suffix = Path(path).suffix.lower()
+def _read_text_robust(path: Union[str, Path]) -> str:
+    p = Path(path)
+    # UTF-8 with BOM tolerance first
+    try:
+        return p.read_text(encoding="utf-8-sig")
+    except UnicodeError:
+        # fallback for accidental UTF-16 saves
+        return p.read_text(encoding="utf-16")
 
+
+def load_config(path: Union[str, Path]) -> Dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Config not found: {p}")
+
+    text = _read_text_robust(p).strip()
+    if not text:
+        return {}
+
+    suffix = p.suffix.lower()
+
+    # YAML
     if suffix in (".yaml", ".yml"):
         try:
             import yaml  # type: ignore
         except Exception as e:
-            raise RuntimeError("PyYAML not available. Install pyyaml or use JSON config.") from e
-        obj = yaml.safe_load(text)
-        if not isinstance(obj, dict):
-            raise ValueError("Config root must be a mapping/dict.")
-        return obj
+            raise RuntimeError(
+                "PyYAML is required to load .yaml configs. Install with: pip install pyyaml"
+            ) from e
 
-    if suffix == ".json":
-        import json
-        obj = json.loads(text)
-        if not isinstance(obj, dict):
-            raise ValueError("Config root must be a mapping/dict.")
-        return obj
+        try:
+            obj = yaml.safe_load(text)
+        except Exception as e:
+            raise ValueError(f"Failed to parse YAML (file={p}): {type(e).__name__}: {e}") from e
 
-    raise ValueError(f"Unsupported config extension: {suffix}")
+    # JSON (default)
+    else:
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise json.JSONDecodeError(f"{e.msg} (file={p})", e.doc, e.pos) from e
+
+    if obj is None:
+        return {}
+    if not isinstance(obj, dict):
+        raise ValueError(f"Config must be a dict/object (file={p}), got {type(obj).__name__}")
+    return obj

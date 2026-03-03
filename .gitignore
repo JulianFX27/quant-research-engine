@@ -11,3 +11,8 @@ data/derived/
 *.bak2
 *.bak3
 baseline
+# runtime
+state/
+results/
+_backup_*/
+paper_LOCAL_*/
