@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 
 from src.live.csv_tail_provider import TailCSVBarProvider, TailCSVConfig, TailBar
 from src.live.state.shadow_state_store import ShadowStateStore
@@ -122,7 +122,55 @@ def _resolve_csv_path(args_csv: str) -> str:
     return ""
 
 
-# ---------- STRATEGY HOOK (placeholder) ----------
+def _get_nested(d: Dict[str, Any], keys: Tuple[str, ...], default: Any = None) -> Any:
+    cur: Any = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _to_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(float(x))
+    except Exception:
+        return None
+
+
+def _strategy_id_from_cfg(frozen_cfg: Dict[str, Any]) -> str:
+    # Prefer explicit id/name; then strategy label.
+    return str(
+        frozen_cfg.get("strategy_id")
+        or frozen_cfg.get("strategy")
+        or frozen_cfg.get("execution_policy", {}).get("strategy")
+        or frozen_cfg.get("execution_policy", {}).get("name")
+        or "UNKNOWN"
+    )
+
+
+def _strategy_version_from_cfg(frozen_cfg: Dict[str, Any]) -> str:
+    # If no explicit version, use policy name as stable version label.
+    return str(
+        frozen_cfg.get("strategy_version")
+        or frozen_cfg.get("version")
+        or frozen_cfg.get("execution_policy", {}).get("name")
+        or "UNKNOWN"
+    )
+
+
+# ---------- STRATEGY HOOK (wired minimal) ----------
 def decide_readonly(
     *,
     bar: Dict[str, Any],
@@ -132,11 +180,60 @@ def decide_readonly(
     account_mode: str,
 ) -> Tuple[str, str, float, float, int, str, str]:
     """
+    Minimal shadow wiring:
+    - Gate by require_event + event_z_threshold vs abs(shock_z)
+    - If event valid -> WOULD_TRADE with mean-reversion direction:
+        shock_z > 0 => SHORT
+        shock_z < 0 => LONG
+
     Returns:
       decision, side, sl_pips, tp_pips, max_hold_min, reason, strategy_version
     """
-    strategy_version = str(frozen_cfg.get("strategy_version", frozen_cfg.get("version", "UNKNOWN")))
-    return ("NO_TRADE", "", 0.0, 0.0, 0, "PLACEHOLDER_NOT_WIRED", strategy_version)
+    strategy_version = _strategy_version_from_cfg(frozen_cfg)
+
+    # Gate params (defaults match checkpoint: require_event=True, z_threshold=2.0)
+    require_event = frozen_cfg.get("require_event")
+    if require_event is None:
+        require_event = _get_nested(frozen_cfg, ("strategy", "require_event"), default=True)
+    require_event = bool(require_event)
+
+    z_thr = frozen_cfg.get("event_z_threshold")
+    if z_thr is None:
+        z_thr = frozen_cfg.get("shock_z_threshold")
+    if z_thr is None:
+        z_thr = _get_nested(frozen_cfg, ("strategy", "event_z_threshold"), default=2.0)
+    z_thr_f = float(z_thr)
+
+    shock_z = _to_float(bar.get("shock_z"))
+    if shock_z is None:
+        return ("NO_TRADE", "", 0.0, 0.0, 0, "MISSING_SHOCK_Z", strategy_version)
+
+    if require_event and abs(shock_z) < z_thr_f:
+        return ("NO_TRADE", "", 0.0, 0.0, 0, f"NO_EVENT(abs_z<{z_thr_f:.2f})", strategy_version)
+
+    side = "SHORT" if shock_z > 0 else "LONG"
+
+    # Risk params: frozen_cfg -> exec_cfg -> defaults
+    sl_pips = _to_float(frozen_cfg.get("sl_pips")) or _to_float(_get_nested(frozen_cfg, ("risk", "sl_pips"), None))
+    tp_pips = _to_float(frozen_cfg.get("tp_pips")) or _to_float(_get_nested(frozen_cfg, ("risk", "tp_pips"), None))
+    max_hold_min = _to_int(frozen_cfg.get("max_hold_min")) or _to_int(_get_nested(frozen_cfg, ("risk", "max_hold_min"), None))
+
+    if sl_pips is None:
+        sl_pips = _to_float(_get_nested(exec_cfg, ("trade_controls", "sl_pips"), None))
+    if tp_pips is None:
+        tp_pips = _to_float(_get_nested(exec_cfg, ("trade_controls", "tp_pips"), None))
+    if max_hold_min is None:
+        max_hold_min = _to_int(_get_nested(exec_cfg, ("trade_controls", "max_hold_min"), None))
+
+    # Defaults (Anchor MR Pure 8p baseline)
+    if sl_pips is None:
+        sl_pips = 8.0
+    if tp_pips is None:
+        tp_pips = 8.0
+    if max_hold_min is None:
+        max_hold_min = 120
+
+    return ("WOULD_TRADE", side, float(sl_pips), float(tp_pips), int(max_hold_min), "EVENT_OK", strategy_version)
 
 
 def _tailbar_to_dict(event: TailBar, *, time_col: str) -> Dict[str, Any]:
@@ -168,10 +265,8 @@ def main() -> None:
     if not csv_path:
         raise SystemExit("Missing feed CSV path: provide --csv or set ENV FEAT / MT5")
 
-    # normalize path (helpful in logs)
     csv_path_resolved = str(Path(csv_path).expanduser())
 
-    # Validate file exists early (fail-fast)
     p = Path(csv_path_resolved)
     if not p.exists():
         raise SystemExit(f"CSV does not exist: {csv_path_resolved}")
@@ -223,8 +318,9 @@ def main() -> None:
 
         bar_key = getattr(event, "bar_key", "")
         if not bar_key:
-            row_repr = "|".join([f"{k}={bar.get(k)}" for k in sorted(bar.keys())])
-            bar_key = sha1_16(row_repr)
+            # Ensure stable hash across runs for the same bar (row_idx + ts_utc is usually enough)
+            bar_ts = str(bar.get(args.time_col) or "")
+            bar_key = sha1_16(f"{bar_ts}|{row_idx}")
 
         if state.is_seen(bar_key):
             continue
@@ -239,12 +335,12 @@ def main() -> None:
                 override_cfg=override_cfg,
                 account_mode=args.account_mode,
             )
-            strategy_id = str(frozen_cfg.get("strategy_id", frozen_cfg.get("strategy", "UNKNOWN")))
+            strategy_id = _strategy_id_from_cfg(frozen_cfg)
         except Exception as e:
             decision, side, sl_pips, tp_pips, max_hold_min = "ERROR", "", 0.0, 0.0, 0
             reason = f"EXC:{type(e).__name__}"
-            strategy_id = str(frozen_cfg.get("strategy_id", frozen_cfg.get("strategy", "UNKNOWN")))
-            strategy_version = str(frozen_cfg.get("strategy_version", frozen_cfg.get("version", "UNKNOWN")))
+            strategy_id = _strategy_id_from_cfg(frozen_cfg)
+            strategy_version = _strategy_version_from_cfg(frozen_cfg)
 
         out.append(
             ShadowDecision(
