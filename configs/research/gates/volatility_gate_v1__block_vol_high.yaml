@@ -1,0 +1,105 @@
+policy_id: volatility_gate_v1__block_vol_high
+strategy: Anchor Research Volatility Gate
+instrument: EURUSD
+timeframe: M5
+
+binning:
+  shock_col: shock_z
+  shock_ret_col: shock_log_ret
+  shock_bins: 4
+  vol_col: atr_14
+  vol_bins: 3
+  session_bucket_min: 30
+
+thresholds:
+  min_n: 0
+
+rules:
+  enable_shock_vol:
+    - shock_sign: "+"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_LOW
+    - shock_sign: "+"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_LOW
+    - shock_sign: "+"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_LOW
+    - shock_sign: "+"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_LOW
+
+    - shock_sign: "-"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_LOW
+    - shock_sign: "-"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_LOW
+    - shock_sign: "-"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_LOW
+    - shock_sign: "-"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_LOW
+
+    - shock_sign: "+"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_MED
+    - shock_sign: "+"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_MED
+    - shock_sign: "+"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_MED
+    - shock_sign: "+"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_MED
+
+    - shock_sign: "-"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_MED
+    - shock_sign: "-"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_MED
+    - shock_sign: "-"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_MED
+    - shock_sign: "-"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_MED
+
+  disable_shock_vol:
+    - shock_sign: "+"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_HIGH
+    - shock_sign: "+"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_HIGH
+    - shock_sign: "+"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_HIGH
+    - shock_sign: "+"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_HIGH
+
+    - shock_sign: "-"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_HIGH
+    - shock_sign: "-"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_HIGH
+    - shock_sign: "-"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_HIGH
+    - shock_sign: "-"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_HIGH
+
+  disable_session_buckets: []
+
+meta:
+  purpose: "Pure volatility gate for anchor freqcap research"
+  rule: "Allow VOL_LOW and VOL_MED only; block VOL_HIGH"
+  source_runs:
+    baseline_realistic: "20260307_033851_127210_fa3c4b92"
+    delay1_realistic: "20260306_184200_106994_b8fa7c2d"
