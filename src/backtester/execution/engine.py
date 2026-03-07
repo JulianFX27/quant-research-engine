@@ -45,6 +45,9 @@ class SimpleBarEngine:
       - fill_mode: close | next_open
       - intrabar_path: OHLC | OLHC
       - intrabar_tie: sl_first | tp_first
+      - execution_price_mode:
+          * mid_costs
+          * synthetic_bid_ask
 
     ARCH A/B:
       - force_exit_on_eof:
@@ -62,6 +65,18 @@ class SimpleBarEngine:
     Time-stop strategies (no SL/TP in price):
       - Set risk.allow_missing_sl: true
       - Provide risk.risk_proxy_price > 0 (in price units) to enable R metrics
+
+    Pricing modes:
+      - mid_costs:
+          * preserves legacy trigger semantics (mid-bar OHLC triggers)
+          * fills still include spread/slippage in entry/exit prices
+      - synthetic_bid_ask:
+          * assumes input OHLC are MID prices
+          * derives synthetic bid/ask using spread/2
+          * evaluates TP/SL with the correct execution side:
+              long exits against BID
+              short exits against ASK
+          * fills include slippage adversarially
     """
 
     def __init__(self, *, costs: Dict[str, Any], exec_cfg: Dict[str, Any], risk_cfg: Optional[Dict[str, Any]] = None):
@@ -72,6 +87,9 @@ class SimpleBarEngine:
 
         raw_path = str(exec_cfg.get("intrabar_path", "OHLC")).replace(" ", "").upper()
         self.intrabar_path = raw_path if raw_path in ("OHLC", "OLHC") else "OHLC"
+
+        raw_price_mode = str(exec_cfg.get("execution_price_mode", "mid_costs")).strip().lower()
+        self.execution_price_mode = raw_price_mode if raw_price_mode in {"mid_costs", "synthetic_bid_ask"} else "mid_costs"
 
         risk_cfg_in = risk_cfg or {}
         risk_cfg_norm: Dict[str, Any] = dict(risk_cfg_in)
@@ -113,7 +131,7 @@ class SimpleBarEngine:
         self.min_risk_price: float = _mrp_f
         risk_cfg_norm["min_risk_price"] = float(self.min_risk_price)
 
-        # --- NEW: allow time-stop strategies with no SL ---
+        # --- allow time-stop strategies with no SL ---
         self.allow_missing_sl: bool = bool(risk_cfg_norm.get("allow_missing_sl", False))
         risk_cfg_norm["allow_missing_sl"] = bool(self.allow_missing_sl)
 
@@ -161,24 +179,75 @@ class SimpleBarEngine:
         return float(self.costs.get("slippage_price", 0.0))
 
     def _fill_entry(self, mid: float, side: str) -> float:
+        """
+        Entry fill from mid reference price.
+
+        mid_costs:
+          - preserves previous behavior
+        synthetic_bid_ask:
+          - assumes mid is mid_open/close and fills at ask/bid +/- slippage
+        """
         half = self._spread_half()
         slip = self._slip()
         if side == "BUY":
-            return mid + half + slip
-        return mid - half - slip
+            return float(mid) + half + slip
+        return float(mid) - half - slip
 
     def _fill_exit(self, level_price: float, pos_side: str) -> float:
+        """
+        Exit fill from target/stop/close reference price.
+
+        For long exits, trader sells -> bid side -> adverse slippage downward.
+        For short exits, trader buys  -> ask side -> adverse slippage upward.
+        """
         half = self._spread_half()
         slip = self._slip()
         if pos_side == "BUY":
-            return level_price - half - slip
-        return level_price + half + slip
+            return float(level_price) - half - slip
+        return float(level_price) + half + slip
+
+    def _bar_side_bounds(self, *, low_mid: float, high_mid: float, pos_side: str) -> Tuple[float, float]:
+        """
+        Return the effective [low, high] bounds used to test exits for the side
+        that actually closes the position.
+
+        mid_costs:
+          - legacy behavior: use raw mid OHLC bounds
+        synthetic_bid_ask:
+          - long exits are evaluated on BID
+          - short exits are evaluated on ASK
+        """
+        if self.execution_price_mode != "synthetic_bid_ask":
+            return float(low_mid), float(high_mid)
+
+        half = self._spread_half()
+
+        if pos_side == "BUY":
+            # long exits hit on BID
+            return float(low_mid) - half, float(high_mid) - half
+
+        # short exits hit on ASK
+        return float(low_mid) + half, float(high_mid) + half
+
+    @staticmethod
+    def _level_inside_bar(level: float, low: float, high: float) -> bool:
+        return float(low) <= float(level) <= float(high)
 
     def _decide_exit_reason(
         self, o: float, h: float, l: float, c: float, pos_side: str, sl: float, tp: float
     ) -> Optional[str]:
-        hit_sl = l <= sl <= h
-        hit_tp = l <= tp <= h
+        """
+        Decide which exit was touched first inside the bar.
+
+        Trigger detection:
+          - mid_costs: legacy mid-bar trigger check
+          - synthetic_bid_ask: side-correct bid/ask trigger check
+        """
+        eff_low, eff_high = self._bar_side_bounds(low_mid=l, high_mid=h, pos_side=pos_side)
+
+        hit_sl = self._level_inside_bar(float(sl), eff_low, eff_high)
+        hit_tp = self._level_inside_bar(float(tp), eff_low, eff_high)
+
         if not hit_sl and not hit_tp:
             return None
         if hit_sl and not hit_tp:
@@ -186,6 +255,7 @@ class SimpleBarEngine:
         if hit_tp and not hit_sl:
             return "TP"
 
+        # Both touched in same bar -> intrabar path / tie policy
         if self.intrabar_path == "OHLC":
             return "TP" if pos_side == "BUY" else "SL"
         else:
@@ -277,7 +347,6 @@ class SimpleBarEngine:
 
         pnl = self._apply_costs(raw_pnl, pos_qty)
 
-        # Compute hold_minutes deterministically
         hold_m: float | None = None
         try:
             hold_m = float((pd.Timestamp(ts) - pd.Timestamp(entry_time)).total_seconds() / 60.0)
@@ -435,6 +504,8 @@ class SimpleBarEngine:
 
                 # SL/TP intrabar
                 if sl is not None or tp is not None:
+                    eff_low, eff_high = self._bar_side_bounds(low_mid=l, high_mid=h, pos_side=pos_side)
+
                     if sl is not None and tp is not None:
                         reason = self._decide_exit_reason(o, h, l, c, pos_side, float(sl), float(tp))
                         if reason == "SL":
@@ -442,16 +513,17 @@ class SimpleBarEngine:
                         elif reason == "TP":
                             exit_reason, exit_level = "TP", float(tp)
                     elif sl is not None:
-                        if l <= float(sl) <= h:
+                        if self._level_inside_bar(float(sl), eff_low, eff_high):
                             exit_reason, exit_level = "SL", float(sl)
                     elif tp is not None:
-                        if l <= float(tp) <= h:
+                        if self._level_inside_bar(float(tp), eff_low, eff_high):
                             exit_reason, exit_level = "TP", float(tp)
 
                 # Tie-break fallback (defensive)
                 if exit_reason is None and sl is not None and tp is not None:
-                    hit_sl = l <= float(sl) <= h
-                    hit_tp = l <= float(tp) <= h
+                    eff_low, eff_high = self._bar_side_bounds(low_mid=l, high_mid=h, pos_side=pos_side)
+                    hit_sl = self._level_inside_bar(float(sl), eff_low, eff_high)
+                    hit_tp = self._level_inside_bar(float(tp), eff_low, eff_high)
                     if hit_sl and hit_tp:
                         if self.tie_break == "tp_first":
                             exit_reason, exit_level = "TP", float(tp)
@@ -710,13 +782,11 @@ class SimpleBarEngine:
             "final_entries_today": entries_today,
             "final_realized_R_today": realized_R_today,
             "final_stopped_today": stopped_today,
-
             "blocked": {
                 "by_daily_stop": n_blocked_by_daily_stop,
                 "by_max_trades_per_day": n_blocked_by_max_trades,
                 "by_cooldown": n_blocked_by_cooldown,
             },
-
             "entry_gate": {
                 "attempted_entries": attempted_entries,
                 "blocked_total": blocked_total,
@@ -726,20 +796,18 @@ class SimpleBarEngine:
                 "entry_skipped_missing_sl": int(entry_skipped_missing_sl),
                 "entry_skipped_tiny_risk": int(entry_skipped_tiny_risk),
             },
-
             "guardrails": gr_rep,
             "forced_exits": dict(forced_exits),
-
             "entry_fill_dropped": {
                 "dropped_total": int(dropped_entries_total),
                 "dropped_by_reason": dict(dropped_entries_by_reason),
             },
-
             "engine": {
                 "bars_total": int(bars_total),
                 "time_in_position_bars": int(time_in_position_bars),
                 "time_in_position_rate": float(time_in_position_rate),
                 "open_position_at_eof": bool(open_position_at_eof),
+                "execution_price_mode": self.execution_price_mode,
             },
         }
 

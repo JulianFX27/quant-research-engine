@@ -8,7 +8,7 @@ from backtester.strategies.baseline_v1_fixed_rr import BaselineV1FixedRR
 from backtester.strategies.baseline_v2_random_dir import BaselineV2RandomDir
 from backtester.strategies.baseline_v4_vol_bucket_buy import BaselineV4VolBucketBuy
 from backtester.strategies.anchor_reversion_fx import AnchorReversionFX
-
+from backtester.strategies.anchor_reversion_adapter_bt import AnchorReversionAdapterBT
 
 REGISTRY: Dict[str, Type[Strategy]] = {
     "ExampleMomentum": ExampleMomentum,
@@ -16,6 +16,7 @@ REGISTRY: Dict[str, Type[Strategy]] = {
     "BaselineV2RandomDir": BaselineV2RandomDir,
     "BaselineV4VolBucketBuy": BaselineV4VolBucketBuy,
     "AnchorReversionFX": AnchorReversionFX,
+    "AnchorReversionAdapterBT": AnchorReversionAdapterBT,
 }
 
 
