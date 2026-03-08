@@ -1,0 +1,62 @@
+name: anchor_research_ftmo_parity_no_event_v1
+
+symbol: EURUSD
+timeframe: M5
+
+data_path: data/anchor_reversion_fx/data/eurusd_m5_features.csv
+
+instrument:
+  pip_size: 0.0001
+  data_source: local_csv
+
+costs:
+  commission: 0.0
+  spread_pips: 1.0
+  slippage_pips: 0.2
+
+execution:
+  fill_mode: next_open
+  intrabar_path: OHLC
+  intrabar_tie: sl_first
+  entry_delay_bars: 0
+
+risk:
+  validity_mode: strict_no_eof
+  force_exit_on_eof: true
+  eof_buffer_bars: 300
+  max_holding_bars: 96
+  max_concurrent_positions: 1
+
+  # Paridad FTMO/paper sin filtro de evento
+  max_trades_per_day: 1
+  max_daily_loss_R: 2.0
+  cooldown_bars: 0
+
+  allowed_forced_exit_reasons:
+    - FORCE_MAX_HOLD
+
+strategy:
+  name: AnchorReversionAdapterBT
+  params:
+    qty: 1.0
+
+    anchor_col: ny_open
+    entry_threshold_pips: 8
+    sl_pips: 10
+    tp_pips: 15
+
+    warmup_bars: 0
+    max_hold_bars: 96
+
+    tag: AnchorMR_Pure_8p__ResearchBT__FTMOParityNoEvent_v1
+
+    # Sin filtro de evento
+    require_event: false
+    event_col: shock_z
+    event_z_threshold: 2.0
+    event_window_bars: 96
+    one_trade_per_event: false
+
+    guard_friday_entries: true
+    bar_minutes: 5
+    friday_buffer_minutes: 10
