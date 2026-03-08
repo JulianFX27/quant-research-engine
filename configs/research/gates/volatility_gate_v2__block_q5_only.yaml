@@ -1,0 +1,104 @@
+policy_id: volatility_gate_v2__block_q5_only
+strategy: Anchor Research Volatility Gate Q5 Only
+instrument: EURUSD
+timeframe: M5
+
+binning:
+  shock_col: shock_z
+  shock_ret_col: shock_log_ret
+  shock_bins: 4
+  vol_col: atr_14
+  vol_bins: 3
+  session_bucket_min: 30
+
+thresholds:
+  min_n: 0
+
+rules:
+  enable_shock_vol:
+    - shock_sign: "+"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_LOW
+    - shock_sign: "+"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_LOW
+    - shock_sign: "+"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_LOW
+    - shock_sign: "+"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_LOW
+
+    - shock_sign: "-"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_LOW
+    - shock_sign: "-"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_LOW
+    - shock_sign: "-"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_LOW
+    - shock_sign: "-"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_LOW
+
+    - shock_sign: "+"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_MED
+    - shock_sign: "+"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_MED
+    - shock_sign: "+"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_MED
+    - shock_sign: "+"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_MED
+
+    - shock_sign: "-"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_MED
+    - shock_sign: "-"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_MED
+    - shock_sign: "-"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_MED
+    - shock_sign: "-"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_MED
+
+    - shock_sign: "+"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_HIGH
+    - shock_sign: "+"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_HIGH
+    - shock_sign: "+"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_HIGH
+
+    - shock_sign: "-"
+      shock_mag_bin: Q1
+      vol_bucket: VOL_HIGH
+    - shock_sign: "-"
+      shock_mag_bin: Q2
+      vol_bucket: VOL_HIGH
+    - shock_sign: "-"
+      shock_mag_bin: Q3
+      vol_bucket: VOL_HIGH
+
+  disable_shock_vol:
+    - shock_sign: "+"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_HIGH
+    - shock_sign: "-"
+      shock_mag_bin: Q4
+      vol_bucket: VOL_HIGH
+
+  disable_session_buckets: []
+
+meta:
+  purpose: "Block only the highest-volatility tail (Q5 proxy through VOL_HIGH+Q4)"
+  rule: "Allow LOW, MED, and most HIGH; block only HIGH with strongest shock bin"
+  source_note: "More conservative than full VOL_HIGH block"
