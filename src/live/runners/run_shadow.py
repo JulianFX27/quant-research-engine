@@ -348,6 +348,16 @@ def _build_strategy_from_frozen(frozen: Dict[str, Any]) -> tuple[AnchorReversion
     max_hold_bars = int(params.get("max_hold_bars", params.get("max_hold", params.get("max_holding_bars", 96))))
     tag = str(params.get("tag", "ANCHOR_ADAPTER_FROZEN"))
 
+    # FULL freeze-v2 alignment
+    require_event = bool(params.get("require_event", True))
+    event_col = str(params.get("event_col", "shock_z"))
+    event_z_threshold = float(params.get("event_z_threshold", 2.0))
+    event_window_bars = int(params.get("event_window_bars", 96))
+    one_trade_per_event = bool(params.get("one_trade_per_event", True))
+    guard_friday_entries = bool(params.get("guard_friday_entries", True))
+    bar_minutes = int(params.get("bar_minutes", 5))
+    friday_buffer_minutes = int(params.get("friday_buffer_minutes", 10))
+
     pip_size = float((frozen.get("instrument", {}) or {}).get("pip_size", 0.0001))
 
     strat = AnchorReversionAdapter(
@@ -360,7 +370,14 @@ def _build_strategy_from_frozen(frozen: Dict[str, Any]) -> tuple[AnchorReversion
             warmup_bars=warmup_bars,
             max_hold_bars=max_hold_bars,
             tag=tag,
-            # keep event conditioning defaults from adapter config unless you put them in params later
+            require_event=require_event,
+            event_col=event_col,
+            event_z_threshold=event_z_threshold,
+            event_window_bars=event_window_bars,
+            one_trade_per_event=one_trade_per_event,
+            guard_friday_entries=guard_friday_entries,
+            bar_minutes=bar_minutes,
+            friday_buffer_minutes=friday_buffer_minutes,
         )
     )
 
@@ -372,6 +389,14 @@ def _build_strategy_from_frozen(frozen: Dict[str, Any]) -> tuple[AnchorReversion
         "sl_pips": sl_pips,
         "tp_pips": tp_pips,
         "max_hold_bars": max_hold_bars,
+        "require_event": require_event,
+        "event_col": event_col,
+        "event_z_threshold": event_z_threshold,
+        "event_window_bars": event_window_bars,
+        "one_trade_per_event": one_trade_per_event,
+        "guard_friday_entries": guard_friday_entries,
+        "bar_minutes": bar_minutes,
+        "friday_buffer_minutes": friday_buffer_minutes,
         "tag": tag,
         "pip_size": pip_size,
     }

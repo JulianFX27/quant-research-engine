@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import yaml
 
-from backtester.data.loader import load_bars_csv
 from backtester.orchestrator.run import _canonical_cfg_json, run_from_config
 
 
@@ -45,14 +44,6 @@ def _load_yaml(path: str) -> Dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ValueError("Config must be a top-level mapping")
     return cfg
-
-
-def _as_df_only(res: Any) -> pd.DataFrame:
-    if isinstance(res, tuple):
-        if len(res) == 0:
-            raise ValueError("load_bars_csv returned an empty tuple")
-        return res[0]
-    return res
 
 
 def _to_bool(x: Any) -> Optional[bool]:
@@ -145,14 +136,60 @@ def _slice_df(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.Da
     return df.loc[(df.index >= start) & (df.index <= end)].copy()
 
 
+def _detect_time_column(df: pd.DataFrame) -> str:
+    candidates = ["time", "timestamp", "datetime", "date"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    # fallback: first column if parseable enough
+    if len(df.columns) == 0:
+        raise ValueError("CSV has no columns.")
+    return str(df.columns[0])
+
+
+def _load_full_csv_preserve_columns(path: str) -> pd.DataFrame:
+    """
+    Load the raw source CSV preserving all columns (including feature columns such as
+    atr_14, shock_z, shock_log_ret, etc.) and set a UTC DatetimeIndex.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Data file not found: {path}")
+
+    df = pd.read_csv(p)
+    if df.empty:
+        raise ValueError(f"CSV is empty: {path}")
+
+    time_col = _detect_time_column(df)
+    ts = pd.to_datetime(df[time_col], utc=True, errors="coerce")
+    if ts.isna().all():
+        raise ValueError(f"Could not parse a valid UTC time column from: {time_col}")
+
+    df = df.loc[~ts.isna()].copy()
+    ts = ts.loc[~ts.isna()]
+
+    df.index = pd.DatetimeIndex(ts, tz="UTC", name="time")
+    # Keep all original columns except the explicit time column;
+    # it will be re-inserted on write.
+    if time_col in df.columns:
+        df = df.drop(columns=[time_col])
+
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+
+    return df
+
+
 def _write_slice_csv(df_slice: pd.DataFrame, path: str) -> None:
     out = df_slice.copy()
+
     if out.index.tz is None:
         out.index = out.index.tz_localize("UTC")
     else:
         out.index = out.index.tz_convert("UTC")
 
-    out.insert(0, "time", out.index.astype("datetime64[ns, UTC]").astype(str))
+    # Reinsert canonical "time" column for downstream loaders / gates
+    out.insert(0, "time", out.index.astype(str))
 
     preferred = ["time", "open", "high", "low", "close"]
     cols = preferred + [c for c in out.columns if c not in preferred]
@@ -203,7 +240,7 @@ def _ensure_fold_eof_alignment(fold_cfg: Dict[str, Any], eof_buffer_bars: int) -
     Critical WF correctness:
       - Slicing CSV removes last `eof_buffer_bars` bars, but the engine/guardrails
         only gate entries using risk.eof_buffer_bars. If it stays at the base YAML
-        value (e.g., 50) while slices are cut by 120, you'll still get FORCE_EOF.
+        value while slices are cut by a larger buffer, you can still get FORCE_EOF.
       - Therefore, propagate eof_buffer_bars into fold_cfg.risk.eof_buffer_bars.
 
     Optional safety:
@@ -224,6 +261,20 @@ def _ensure_fold_eof_alignment(fold_cfg: Dict[str, Any], eof_buffer_bars: int) -
 
     if mh_i <= 0:
         fold_cfg["risk"]["max_holding_bars"] = int(eof_buffer_bars)
+
+
+def _align_policy_gate_features_path(fold_cfg: Dict[str, Any], slice_path: str) -> None:
+    """
+    Critical WF correctness for policy-gated strategies:
+      - The fold run uses fold_cfg["data_path"] = slice_path
+      - If policy_gate.features_path still points to the original full dataset,
+        the gate may join against timestamps/features outside the fold.
+      - Therefore, override policy_gate.features_path to the current fold slice.
+    """
+    pg = fold_cfg.get("policy_gate")
+    if isinstance(pg, dict):
+        pg["features_path"] = slice_path
+        fold_cfg["policy_gate"] = pg
 
 
 def main() -> int:
@@ -274,13 +325,8 @@ def main() -> int:
     if eof_buffer_bars < 0:
         eof_buffer_bars = max(cfg_max_hold_int, 0)
 
-    # Load full dataset once
-    res_full = load_bars_csv(
-        base_cfg["data_path"],
-        return_fingerprint=False,
-        dataset_id="prov",
-    )
-    df_full = _as_df_only(res_full)
+    # Load full dataset once, preserving ALL feature columns
+    df_full = _load_full_csv_preserve_columns(base_cfg["data_path"])
 
     if not isinstance(df_full.index, pd.DatetimeIndex):
         raise ValueError("Loaded dataframe index must be a DatetimeIndex (UTC).")
@@ -304,7 +350,6 @@ def main() -> int:
         if len(df_slice) == 0:
             continue
 
-        # NOTE: file name uses *requested* date range (start/end days), not necessarily exact last timestamp
         slice_fname = (
             f"{symbol}_{timeframe}_"
             f"{start.date().isoformat()}__{end.date().isoformat()}__{source}__fold{k:03d}.csv"
@@ -313,10 +358,8 @@ def main() -> int:
 
         _write_slice_csv(df_slice, slice_path)
 
-        # ✅ Content-addressed identity for WF slice (fp8 from file bytes)
         wf_slice_fp8 = _fp8_from_file(slice_path)
 
-        # ✅ Force a dataset_id that cannot collide across regenerated slices
         wf_dataset_id_forced = (
             f"{symbol}_{timeframe}_"
             f"{start.date().isoformat()}__{end.date().isoformat()}__{source}"
@@ -324,19 +367,17 @@ def main() -> int:
         )
 
         fold_cfg = _deepcopy_json(base_cfg)
-        fold_cfg["name"] = f"{base_cfg.get('name','run')}_WF_FOLD_{k:03d}"
+        fold_cfg["name"] = f"{base_cfg.get('name', 'run')}_WF_FOLD_{k:03d}"
         fold_cfg["data_path"] = slice_path
-
-        # ✅ Force fold dataset_id (required to avoid registry collisions on regenerated slices)
         fold_cfg["dataset_id"] = wf_dataset_id_forced
 
-        # ✅ CRITICAL: align engine EOF gate with WF truncation (fixes INVALID_SAMPLE_EOF)
+        # Critical alignment fixes
+        _align_policy_gate_features_path(fold_cfg, slice_path=slice_path)
         _ensure_fold_eof_alignment(fold_cfg, eof_buffer_bars=eof_buffer_bars)
 
         out = run_from_config(fold_cfg, out_dir=args.runs_out_dir)
         m = out.get("metrics", {}) or {}
 
-        # Canonical counters from metrics.json
         n_trades = int(m.get("n_trades") or 0)
         forced_exits_total = int(m.get("forced_exits_total") or 0)
         forced_eof_total = int(m.get("forced_eof_total") or 0)
@@ -366,12 +407,10 @@ def main() -> int:
                 "run_dir": (out.get("outputs", {}) or {}).get("run_dir"),
                 "wf_slice_fp8": wf_slice_fp8,
                 "wf_dataset_id_forced": wf_dataset_id_forced,
-                # helpful: what WF intended for this fold
                 "wf_eof_buffer_bars": int(eof_buffer_bars),
             }
         )
 
-        # ✅ Pull-through entry-gate v2 EOF buffer diagnostics (from metrics.json)
         eg_v2_attempted = m.get("entry_gate_v2_attempted_entries")
         eg_v2_blocked_total = m.get("entry_gate_v2_blocked_total")
         eg_v2_blocked_unique = m.get("entry_gate_v2_blocked_unique_bars")
@@ -408,7 +447,6 @@ def main() -> int:
                 "max_drawdown_R_pct": m.get("max_drawdown_R_pct"),
                 "max_consecutive_losses_R": m.get("max_consecutive_losses_R"),
 
-                # Entry-gate v2 diagnostics (so it exists in WF leaderboard.csv)
                 "entry_gate_v2_attempted_entries": eg_v2_attempted,
                 "entry_gate_v2_blocked_total": eg_v2_blocked_total,
                 "entry_gate_v2_blocked_unique_bars": eg_v2_blocked_unique,
@@ -435,7 +473,6 @@ def main() -> int:
                 "risk_final_realized_R_today": m.get("risk_final_realized_R_today"),
                 "risk_final_stopped_today": m.get("risk_final_stopped_today"),
 
-                # helpful: effective engine EOF settings (from run.py metrics)
                 "risk_eof_buffer_bars": m.get("risk_eof_buffer_bars"),
                 "risk_force_exit_on_eof": m.get("risk_force_exit_on_eof"),
 
@@ -507,6 +544,10 @@ def main() -> int:
             "eof_policy": (
                 "WF truncates the last eof_buffer_bars AND forces fold_cfg.risk.eof_buffer_bars to the same value "
                 "(critical) so the engine/guardrails gate entries consistently."
+            ),
+            "policy_gate_alignment": (
+                "When policy_gate is present, features_path is overridden to the current fold slice "
+                "so gate evaluation stays aligned with the fold dataset."
             ),
             "wf_dataset_id_policy": "Per-fold dataset_id is content-addressed with fp8(file_sha256) to avoid collisions.",
         },

@@ -1,0 +1,39 @@
+datasets:
+
+  EURUSD_M5_2014-01-01__2024-12-31__dukascopy_v2_clean:
+
+    status: canonical
+
+    description: >
+      EURUSD M5 dataset generated from Dukascopy minute data,
+      merged from yearly CSV files, resampled to 5-minute candles,
+      and cleaned for OHLC integrity.
+
+    source:
+      provider: Dukascopy
+      base_data: minute candles
+      processing:
+        - merge yearly CSV files
+        - resample to M5
+        - remove invalid OHLC rows
+
+    timeframe: M5
+    instrument: EURUSD
+
+    start: "2014-01-01 22:00:00"
+    end: "2024-12-31 21:55:00"
+
+    rows: 821250
+
+    file: data/canonical/EURUSD_M5_2014-01-01__2024-12-31__dukascopy_v2_clean.csv
+
+    hash:
+      sha256: a44795d74fa521864a76a2b41411d86c190320ed45b78ca083bff2cb5a48971c
+      fp8: a44795d7
+
+    audit:
+      ohlc_invalid_rows: 0
+      gaps_gt_10m: 627
+      intraday_gaps_estimated: 34
+
+    created: "2026-03-11"

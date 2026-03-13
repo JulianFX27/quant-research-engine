@@ -495,6 +495,18 @@ def main() -> None:
     tp_pips = float(params.get("tp_pips", 15.0))
     max_hold_bars = int(params.get("max_hold_bars", params.get("max_hold", params.get("max_holding_bars", 96))))
 
+    tag = str(params.get("tag", "ANCHOR_ADAPTER_FROZEN"))
+
+    # FULL freeze-v2 alignment
+    require_event = bool(params.get("require_event", True))
+    event_col = str(params.get("event_col", "shock_z"))
+    event_z_threshold = float(params.get("event_z_threshold", 2.0))
+    event_window_bars = int(params.get("event_window_bars", 96))
+    one_trade_per_event = bool(params.get("one_trade_per_event", True))
+    guard_friday_entries = bool(params.get("guard_friday_entries", True))
+    bar_minutes = int(params.get("bar_minutes", 5))
+    friday_buffer_minutes = int(params.get("friday_buffer_minutes", 10))
+
     pip_size = float((frozen.get("instrument", {}) or {}).get("pip_size", 0.0001))
 
     strat = AnchorReversionAdapter(
@@ -506,8 +518,32 @@ def main() -> None:
             tp_pips=tp_pips,
             warmup_bars=warmup_bars,
             max_hold_bars=max_hold_bars,
-            tag=str(params.get("tag", "ANCHOR_ADAPTER_FROZEN")),
+            tag=tag,
+            require_event=require_event,
+            event_col=event_col,
+            event_z_threshold=event_z_threshold,
+            event_window_bars=event_window_bars,
+            one_trade_per_event=one_trade_per_event,
+            guard_friday_entries=guard_friday_entries,
+            bar_minutes=bar_minutes,
+            friday_buffer_minutes=friday_buffer_minutes,
         )
+    )
+
+    append_log(
+        paths["logs"],
+        f"[{utc_now_iso()}] strategy_cfg "
+        f"anchor_col={anchor_col} "
+        f"entry_threshold_pips={entry_threshold_pips} "
+        f"exit_threshold_pips={exit_threshold_pips} "
+        f"sl_pips={sl_pips} tp_pips={tp_pips} "
+        f"max_hold_bars={max_hold_bars} "
+        f"require_event={require_event} "
+        f"event_col={event_col} event_z_threshold={event_z_threshold} "
+        f"event_window_bars={event_window_bars} one_trade_per_event={one_trade_per_event} "
+        f"guard_friday_entries={guard_friday_entries} "
+        f"bar_minutes={bar_minutes} friday_buffer_minutes={friday_buffer_minutes} "
+        f"tag={tag}"
     )
 
     gate: Optional[PolicyGate] = None
@@ -581,6 +617,15 @@ def main() -> None:
             "tp_pips": tp_pips,
             "warmup_bars": warmup_bars,
             "max_hold_bars": max_hold_bars,
+            "require_event": require_event,
+            "event_col": event_col,
+            "event_z_threshold": event_z_threshold,
+            "event_window_bars": event_window_bars,
+            "one_trade_per_event": one_trade_per_event,
+            "guard_friday_entries": guard_friday_entries,
+            "bar_minutes": bar_minutes,
+            "friday_buffer_minutes": friday_buffer_minutes,
+            "tag": tag,
             "pip_size": pip_size,
         },
         "gate": {

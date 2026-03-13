@@ -1,0 +1,18 @@
+strategy_name: NY_OPENING_MOMENTUM_V2
+symbol: USDJPY
+
+data:
+  csv_path: data/canonical/USDJPY_M5_2014-01-01__2024-12-31__dukascopy_v2_clean.csv
+
+signal:
+  threshold_q: 0.80
+  impulse_efficiency_min: 0.70
+  entry_delay_min: 30
+  holding_min: 30
+
+execution:
+  pip_size_price: 0.01
+  cost_pips: 1.0
+
+outputs:
+  out_dir: results/strategies/ny_opening_momentum_v2/usdjpy

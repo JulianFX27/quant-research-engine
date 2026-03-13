@@ -1,0 +1,14 @@
+strategy_name: NY_OPENING_MOMENTUM_V2
+symbol: EURUSD
+data:
+  csv_path: data/canonical/EURUSD_M5_2014-01-01__2024-12-31__dukascopy_v2_clean.csv
+signal:
+  threshold_q: 0.8
+  impulse_efficiency_min: 0.75
+  entry_delay_min: 30
+  holding_min: 40
+execution:
+  pip_size_price: 0.0001
+  cost_pips: 1.0
+outputs:
+  out_dir: results/strategies/ny_opening_momentum_v2/batch_eurusd/nyomv2_eurusd_tq08_eff075_ed30_h40

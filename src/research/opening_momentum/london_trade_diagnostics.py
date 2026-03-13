@@ -1,0 +1,190 @@
+from __future__ import annotations
+
+from pathlib import Path
+import pandas as pd
+import numpy as np
+
+
+EVENTS_PATH = Path(
+    "results/research/opening_momentum/london_event_surface_dstaware.csv"
+)
+
+OUTPUT_DIR = Path(
+    "results/research/opening_momentum/london_trade_diagnostics"
+)
+
+THRESHOLD_Q = 0.925
+RANGE_TOP_FRAC = 0.35
+ENTRY_DELAY = 30
+HOLDING = 30
+PIP_SIZE = 0.0001
+COST_PIPS = 1.0
+
+
+def apply_range_filter(df: pd.DataFrame, top_frac: float) -> pd.DataFrame:
+    cutoff = df["range_30m"].quantile(1 - top_frac)
+    out = df[df["range_30m"] >= cutoff].copy()
+    out["range_cutoff"] = cutoff
+    return out
+
+
+def build_trades(df: pd.DataFrame) -> pd.DataFrame:
+    sub = apply_range_filter(df, RANGE_TOP_FRAC)
+
+    q_low = sub["ret_30m"].quantile(1 - THRESHOLD_Q)
+    q_high = sub["ret_30m"].quantile(THRESHOLD_Q)
+
+    ret_col = f"ret_fwd_{HOLDING}m_from_{ENTRY_DELAY}m"
+    cost_ret = COST_PIPS * PIP_SIZE
+
+    longs = sub[sub["ret_30m"] > q_high].copy()
+    shorts = sub[sub["ret_30m"] < q_low].copy()
+
+    longs["side"] = "long"
+    longs["gross_ret"] = longs[ret_col]
+
+    shorts["side"] = "short"
+    shorts["gross_ret"] = -shorts[ret_col]
+
+    trades = pd.concat([longs, shorts], axis=0).dropna(subset=["gross_ret"]).copy()
+    trades["date"] = pd.to_datetime(trades["date"])
+    trades["year"] = trades["date"].dt.year
+    trades = trades.sort_values(["date", "side"]).reset_index(drop=True)
+    trades["net_ret"] = trades["gross_ret"] - cost_ret
+    trades["trade_id"] = np.arange(1, len(trades) + 1)
+
+    return trades
+
+
+def max_drawdown(equity: pd.Series) -> float:
+    running_max = equity.cummax()
+    dd = equity - running_max
+    return float(dd.min())
+
+
+def max_losing_streak(returns: pd.Series) -> int:
+    streak = 0
+    max_streak = 0
+    for r in returns:
+        if r <= 0:
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+    return max_streak
+
+
+def summarize_distribution(trades: pd.DataFrame) -> pd.DataFrame:
+    r = trades["net_ret"]
+
+    summary = pd.DataFrame(
+        [
+            {
+                "n_trades": len(r),
+                "mean_return": r.mean(),
+                "median_return": r.median(),
+                "std_return": r.std(),
+                "min_return": r.min(),
+                "max_return": r.max(),
+                "p05": r.quantile(0.05),
+                "p25": r.quantile(0.25),
+                "p75": r.quantile(0.75),
+                "p95": r.quantile(0.95),
+                "winrate": (r > 0).mean(),
+                "skew_proxy_mean_minus_median": r.mean() - r.median(),
+            }
+        ]
+    )
+
+    return summary
+
+
+def summarize_streaks_and_dd(trades: pd.DataFrame) -> pd.DataFrame:
+    eq = trades["net_ret"].cumsum()
+
+    summary = pd.DataFrame(
+        [
+            {
+                "final_equity_ret": eq.iloc[-1],
+                "max_drawdown_ret": max_drawdown(eq),
+                "max_losing_streak": max_losing_streak(trades["net_ret"]),
+            }
+        ]
+    )
+
+    return summary
+
+
+def summarize_concentration(trades: pd.DataFrame) -> pd.DataFrame:
+    df = trades.copy()
+    df["month"] = df["date"].dt.to_period("M").astype(str)
+
+    by_year = (
+        df.groupby("year")
+        .agg(
+            n_trades=("net_ret", "count"),
+            mean_return=("net_ret", "mean"),
+            total_return=("net_ret", "sum"),
+        )
+        .reset_index()
+    )
+
+    by_month = (
+        df.groupby("month")
+        .agg(
+            n_trades=("net_ret", "count"),
+            total_return=("net_ret", "sum"),
+        )
+        .reset_index()
+        .sort_values("total_return", ascending=False)
+    )
+
+    return by_year, by_month
+
+
+def build_equity(trades: pd.DataFrame) -> pd.DataFrame:
+    eq = trades[["trade_id", "date", "side", "net_ret"]].copy()
+    eq["equity_ret"] = eq["net_ret"].cumsum()
+    return eq
+
+
+def main() -> None:
+    df = pd.read_csv(EVENTS_PATH)
+    trades = build_trades(df)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    trades.to_csv(OUTPUT_DIR / "trades.csv", index=False)
+
+    dist_summary = summarize_distribution(trades)
+    dist_summary.to_csv(OUTPUT_DIR / "distribution_summary.csv", index=False)
+
+    dd_summary = summarize_streaks_and_dd(trades)
+    dd_summary.to_csv(OUTPUT_DIR / "dd_streak_summary.csv", index=False)
+
+    by_year, by_month = summarize_concentration(trades)
+    by_year.to_csv(OUTPUT_DIR / "by_year.csv", index=False)
+    by_month.to_csv(OUTPUT_DIR / "by_month.csv", index=False)
+
+    equity = build_equity(trades)
+    equity.to_csv(OUTPUT_DIR / "equity_curve.csv", index=False)
+
+    print("\n=== TRADE DISTRIBUTION SUMMARY ===\n")
+    print(dist_summary.to_string(index=False))
+
+    print("\n=== DRAWDOWN / STREAK SUMMARY ===\n")
+    print(dd_summary.to_string(index=False))
+
+    print("\n=== BY YEAR ===\n")
+    print(by_year.to_string(index=False))
+
+    print("\n=== TOP 12 MONTHS BY TOTAL RETURN ===\n")
+    print(by_month.head(12).to_string(index=False))
+
+    print(f"\nSaved trades: {OUTPUT_DIR / 'trades.csv'}")
+    print(f"Saved equity: {OUTPUT_DIR / 'equity_curve.csv'}")
+    print(f"Saved summaries in: {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()
