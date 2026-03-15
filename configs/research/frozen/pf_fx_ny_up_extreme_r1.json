@@ -1,0 +1,91 @@
+{
+  "strategy_id": "PF_FX_NY_UP_EXTREME_R1",
+  "status": "FROZEN",
+  "frozen_at": "2026-03-15",
+
+  "hypothesis": "FX majors exhibit a tradable intraday mean reversion pattern after upward extreme moves during the New York open window.",
+
+  "session": {
+    "mode": "NEW_YORK_DST_AWARE",
+    "session_helper": "src.research.opening_momentum.session_times.ny_open_utc",
+    "session_minutes": 150
+  },
+
+  "event_definition": {
+    "window_min": 30,
+    "z_threshold": 2.0,
+    "direction": "UP_EXTREME",
+    "rolling_vol_lookback_bars": 60
+  },
+
+  "execution": {
+    "entry_delay_bars": 0,
+    "take_profit_pips": 15,
+    "stop_loss_pips": 12,
+    "time_stop_minutes": 20,
+    "spread_pips": 0.8,
+    "slippage_pips": 0.2,
+    "baseline_total_cost_pips": 1.0
+  },
+
+  "validation_window": {
+    "start": "2019-01-02 00:00:00",
+    "end": "2024-12-31 23:55:00"
+  },
+
+  "core_universe": [
+    {
+      "symbol": "EURUSD",
+      "dataset_path": "data/canonical/EURUSD_M5_2014-01-01__2024-12-31__dukascopy_v2_clean.csv",
+      "pip_size": 0.0001
+    },
+    {
+      "symbol": "GBPUSD",
+      "dataset_path": "data/canonical/GBPUSD_M5_2014-01-01__2024-12-31__dukascopy_v2_clean.csv",
+      "pip_size": 0.0001
+    }
+  ],
+
+  "secondary_universe": [
+    {
+      "symbol": "USDJPY",
+      "dataset_path": "data/canonical/USDJPY_M5_2014-01-01__2024-12-31__dukascopy_v2_clean.csv",
+      "pip_size": 0.01
+    }
+  ],
+
+  "results_snapshot": {
+    "EURUSD": {
+      "trades": 560,
+      "winrate": 0.5535714285714286,
+      "expectancy_pips": 1.1394642857142476,
+      "avg_win_pips": 7.332258064516214,
+      "avg_loss_pips": -6.539600000000191,
+      "profit_factor": 1.3902991008624135
+    },
+    "GBPUSD": {
+      "trades": 574,
+      "winrate": 0.5522648083623694,
+      "expectancy_pips": 1.202787456445929,
+      "avg_win_pips": 8.710725552050658,
+      "avg_loss_pips": -8.057976653696869,
+      "profit_factor": 1.3333816215171816
+    },
+    "USDJPY": {
+      "trades": 559,
+      "winrate": 0.4847942754919499,
+      "expectancy_pips": 0.42254025044731586,
+      "avg_win_pips": 7.709963099631216,
+      "avg_loss_pips": -6.434722222222257,
+      "profit_factor": 1.1274552126052495
+    }
+  },
+
+  "next_stage": [
+    "Invariant temporal splits",
+    "walk-forward validation",
+    "portfolio simulation",
+    "Monte Carlo",
+    "prop-firm rules integration"
+  ]
+}

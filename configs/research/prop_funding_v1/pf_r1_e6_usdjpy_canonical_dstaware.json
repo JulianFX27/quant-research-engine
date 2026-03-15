@@ -1,0 +1,40 @@
+{
+  "experiment_id": "PF_R1_E6_USDJPY",
+
+  "dataset": {
+    "path": "data/canonical/USDJPY_M5_2014-01-01__2024-12-31__dukascopy_v2_clean.csv",
+    "timestamp_column": "time",
+    "price_columns": ["open", "high", "low", "close"],
+    "pip_size": 0.01
+  },
+
+  "time_frame": {
+    "start": "2019-01-02 00:00:00",
+    "end": "2024-12-31 23:55:00"
+  },
+
+  "session": {
+    "mode": "NY_DST_AWARE",
+    "session_minutes": 150
+  },
+
+  "event_definition": {
+    "window_min": 30,
+    "z_threshold": 2.0,
+    "direction": "UP_EXTREME",
+    "rolling_vol_lookback_bars": 60
+  },
+
+  "execution": {
+    "entry_delay_bars": 0,
+    "take_profit_pips": 15,
+    "stop_loss_pips": 12,
+    "time_stop_minutes": 20,
+    "spread_pips": 0.8,
+    "slippage_pips": 0.2
+  },
+
+  "outputs": {
+    "results_dir": "results/research/prop_funding_v1/pf_r1_e6_usdjpy"
+  }
+}
